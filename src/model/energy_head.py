@@ -215,7 +215,9 @@ def energy_score(
     pairwise_dists = jnp.linalg.norm(diffs_pairwise, axis=-1)  # (N, N)
     term2 = (1.0 / (n * n)) * jnp.sum(pairwise_dists ** alpha)
 
-    return term1 - term2
+    # numerical safety: return large but finite value if NaN
+    result = term1 - term2
+    return jnp.where(jnp.isfinite(result), result, 1e6)
 
 
 def energy_loss(

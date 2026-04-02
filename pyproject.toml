@@ -19,6 +19,7 @@ dependencies = [
     "datasets>=3.0",
     "tokenizers>=0.21",
     "transformers>=4.40",
+    "matplotlib>=3.10.8",
 ]
 
 [project.optional-dependencies]

@@ -35,24 +35,24 @@ from src.model.config import CONFIGS, QWEN35_VOCAB_SIZE, DEFAULT_TOKENIZER
 # ─── Device / Hardware Profiles ───────────────────────────────────────────────
 
 HARDWARE_PROFILES: dict[str, dict] = {
-    "t4": {  # Colab free / G4 instance
+    "t4": {  # Colab free / G4 instance (~20 AE steps/s, ~2 EGGROLL steps/s)
         "batch_size": 64,
-        "ae_steps": 15_000,
-        "eggroll_steps": 3_000,
+        "ae_steps": 100_000,     # ~83 min — needs this many for 248K vocab convergence
+        "eggroll_steps": 5_000,  # ~42 min
         "pop_size": 32,
         "target_chunks": 250_000,
     },
     "a100": {  # Colab Pro / P4 instance
         "batch_size": 256,
-        "ae_steps": 20_000,
-        "eggroll_steps": 5_000,
+        "ae_steps": 100_000,
+        "eggroll_steps": 10_000,
         "pop_size": 64,
         "target_chunks": 500_000,
     },
     "h100": {  # H100 80GB
         "batch_size": 512,
-        "ae_steps": 30_000,
-        "eggroll_steps": 10_000,
+        "ae_steps": 150_000,
+        "eggroll_steps": 20_000,
         "pop_size": 128,
         "target_chunks": 1_000_000,
     },
@@ -442,7 +442,9 @@ def train_backbone_eggroll(
             return energy_score(samples, z_t)
 
         losses = jax.vmap(pos_loss)(h_in, z_tgt)
-        return -jnp.mean(losses)  # negate: EGGROLL maximizes fitness
+        fitness = -jnp.mean(losses)  # negate: EGGROLL maximizes fitness
+        # guard against NaN/Inf from numerical instability in early training
+        return jnp.where(jnp.isfinite(fitness), fitness, -1e6)
 
     # EGGROLL optimizer
     eggroll_opt, eggroll_state = create_eggroll_optimizer(trainable, learning_rate=lr)

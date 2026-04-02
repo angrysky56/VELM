@@ -206,6 +206,9 @@ class MirasMemoryLayer(eqx.Module):
         # apply α and η as diagonal scaling on rows
         new_state = alpha[:, None] * state - eta[:, None] * grad
 
+        # numerical stability: clamp state to prevent explosion in long scans
+        new_state = jnp.clip(new_state, -10.0, 10.0)
+
         # readout from updated memory
         output = new_state @ k_t  # (dim,)
 
