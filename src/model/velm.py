@@ -27,7 +27,7 @@ from jaxtyping import Array, Float, Int
 from .autoencoder import CALMAutoencoder
 from .miras_backbone import VELMBackbone
 from .energy_head import EnergyHead, energy_score
-from .config import CONFIGS
+from .config import CONFIGS, QWEN35_VOCAB_SIZE
 
 
 class VELM(eqx.Module):
@@ -46,32 +46,36 @@ class VELM(eqx.Module):
 
     def __init__(
         self,
-        config_name: str = "tiny",
-        vocab_size: int = 128256,
-        ae_hidden_dim: int = 512,
-        ae_ffn_intermediate: int = 1024,
+        config_name: str = "gpu_12gb",
+        vocab_size: int = QWEN35_VOCAB_SIZE,
+        ae_hidden_dim: int | None = None,
+        ae_ffn_intermediate: int | None = None,
         *,
         key: jax.Array,
     ) -> None:
         """Initialize VELM from a named configuration.
 
         Args:
-            config_name: one of "tiny", "small", "medium", "large"
-            vocab_size: tokenizer vocabulary size
-            ae_hidden_dim: autoencoder hidden dimension (separate from backbone)
-            ae_ffn_intermediate: autoencoder FFN intermediate dim
+            config_name: one of "smoke", "gpu_12gb", "tiny", "small", "medium", "large"
+            vocab_size: tokenizer vocabulary size (default: Qwen3.5 248320)
+            ae_hidden_dim: autoencoder hidden dim (overrides config if set)
+            ae_ffn_intermediate: autoencoder FFN dim (overrides config if set)
             key: PRNG key
         """
         cfg = CONFIGS[config_name]
         self.chunk_size = cfg["chunk_size_k"]
         k1, k2, k3 = jax.random.split(key, 3)
 
+        # use config values unless explicitly overridden
+        _ae_hdim = ae_hidden_dim or cfg.get("ae_hidden_dim", 512)
+        _ae_ffn = ae_ffn_intermediate or cfg.get("ae_ffn_intermediate", 1024)
+
         self.autoencoder = CALMAutoencoder(
             vocab_size=vocab_size,
             chunk_size=cfg["chunk_size_k"],
-            hidden_dim=ae_hidden_dim,
+            hidden_dim=_ae_hdim,
             latent_dim=cfg["latent_dim"],
-            ffn_intermediate=ae_ffn_intermediate,
+            ffn_intermediate=_ae_ffn,
             key=k1,
         )
 
@@ -82,6 +86,7 @@ class VELM(eqx.Module):
             num_swa_layers=cfg["swa_layers"],
             ffn_intermediate=cfg["ffn_intermediate"],
             chunk_size=cfg["chunk_size_k"],
+            ae_hidden_dim=_ae_hdim,
             key=k2,
         )
 
@@ -136,7 +141,6 @@ class VELM(eqx.Module):
         Returns:
             (mean_energy_loss, metrics_dict)
         """
-        num_chunks = token_ids.shape[0]
 
         # 1. encode all chunks → target latent vectors
         target_z = self.encode_chunks(token_ids)  # (S, l)
@@ -194,7 +198,6 @@ class VELM(eqx.Module):
         Returns:
             (predicted_token_ids, new_backbone_states)
         """
-        k1, k2 = jax.random.split(key)
 
         # 1. compress previous tokens → input representation
         embs = jax.vmap(self.autoencoder.embedding)(prev_token_ids)
@@ -206,7 +209,7 @@ class VELM(eqx.Module):
         h = hidden_seq[0]  # (dim,)
 
         # 3. energy head → predicted latent vector
-        z_pred = self.head.predict(h, key=k1)  # (latent,)
+        z_pred = self.head.predict(h, key=key)  # (latent,)
 
         # 4. decode latent → K token logits → argmax
         logits = self.autoencoder.decode(z_pred)  # (K, vocab)

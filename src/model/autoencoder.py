@@ -100,7 +100,6 @@ class Encoder(eqx.Module):
             (z, mu, logvar) — z is the sampled latent, mu/logvar for KL loss
         """
         k = self.chunk_size
-        d = self.hidden_dim
 
         # 1. position-wise FFN on each token embedding
         h = jax.vmap(self.token_ffn)(token_embeddings)  # (K, d)
@@ -232,7 +231,7 @@ class CALMAutoencoder(eqx.Module):
 
     def __init__(
         self,
-        vocab_size: int = 128256,
+        vocab_size: int = 248077,  # Qwen3.5 tokenizer (actual token count)
         chunk_size: int = 4,
         hidden_dim: int = 512,
         latent_dim: int = 128,

@@ -56,7 +56,7 @@ def train_step(
     def loss_fn(model):
         return batch_ae_loss(model, batch, key=key)
 
-    (loss, metrics), grads = eqx.filter_value_and_grad(loss_fn, has_aux=True)(model)
+    (_, metrics), grads = eqx.filter_value_and_grad(loss_fn, has_aux=True)(model)
     updates, new_opt_state = optimizer.update(grads, opt_state, model)
     new_model = eqx.apply_updates(model, updates)
 
@@ -89,7 +89,7 @@ def main():
     save_dir = Path(args.save_dir)
     save_dir.mkdir(parents=True, exist_ok=True)
 
-    print(f"=== VELM Autoencoder Training ===")
+    print("=== VELM Autoencoder Training ===")
     print(f"Config: {args.config}")
     print(f"Chunk size K: {cfg['chunk_size_k']}")
     print(f"Latent dim: {cfg['latent_dim']}")

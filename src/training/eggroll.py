@@ -176,55 +176,43 @@ def eggroll_step(
     """
     keys = jax.random.split(key, population_size)
 
-    # evaluate population: generate perturbations and compute fitness
+    # ── Evaluate population using jax.lax.map (JIT-friendly) ──────────
+    # jax.lax.map applies a function sequentially over a leading axis
+    # but unlike a Python for-loop, it compiles inside JIT and avoids
+    # Python-level overhead and re-tracing per member.
+
     def eval_member(member_key: jax.Array):
+        """Generate perturbation, evaluate fitness, return both."""
         perturbed, perturbation = perturb_pytree(
             base_params, member_key, sigma, rank
         )
         fitness = fitness_fn(perturbed)
         return fitness, perturbation
 
-    # sequential evaluation (vmap requires fixed structure)
-    # for large populations on GPU, this should be parallelized
-    # via the batched low-rank trick from EGGROLL paper
-    fitnesses = []
-    perturbations = []
-    for i in range(population_size):
-        f, e = eval_member(keys[i])
-        fitnesses.append(f)
-        perturbations.append(e)
+    # jax.lax.map: sequential but JIT-compiled (vmap needs vmappable fn)
+    fitnesses_arr, perturbations_stacked = jax.lax.map(eval_member, keys)
+    # fitnesses_arr: (N,) scalar fitnesses
+    # perturbations_stacked: pytree with leading dim N per leaf
 
-    fitnesses_arr = jnp.array(fitnesses)  # (N,)
-
-    # fitness normalization: rank-based (more robust than raw fitness)
-    # map fitnesses to [-0.5, 0.5] based on rank
+    # ── Fitness normalization: rank-based ──────────────────────────────
+    # map fitnesses to [-0.5, 0.5] based on rank (more robust than raw)
     ranks = jnp.argsort(jnp.argsort(fitnesses_arr)).astype(jnp.float32)
     normalized = 0.5 - ranks / (population_size - 1)  # best=0.5, worst=-0.5
 
-    # ES gradient estimate: ∇M ≈ (1/σN) Σ E_i * f_i
-    # weighted sum of perturbations
-    def weighted_sum(leaves_list: list, weights: jax.Array) -> list:
-        """Compute weighted sum across population for each leaf."""
-        result = []
-        num_leaves = len(leaves_list[0])
-        for j in range(num_leaves):
-            leaf_sum = jnp.zeros_like(leaves_list[0][j])
-            for i in range(len(leaves_list)):
-                leaf_sum = leaf_sum + weights[i] * leaves_list[i][j]
-            result.append(leaf_sum)
-        return result
+    # ── ES gradient: weighted sum of perturbations ────────────────────
+    # perturbations_stacked has shape (N, ...) per leaf — use einsum-style
+    def weighted_leaf_sum(leaf_stack: jax.Array) -> jax.Array:
+        """Sum leaf_stack[i] * weight[i] over population dimension."""
+        # leaf_stack: (N, *shape), normalized: (N,)
+        # broadcast weights to match leaf dims
+        w = normalized.reshape((-1,) + (1,) * (leaf_stack.ndim - 1))
+        return jnp.sum(leaf_stack * w, axis=0)
 
-    # flatten all perturbations for weighted sum
-    perturbation_leaves = [jax.tree.leaves(p) for p in perturbations]
+    es_grad = jax.tree.map(weighted_leaf_sum, perturbations_stacked)
 
-    # compute weighted sum → ES gradient estimate
-    es_grad_leaves = weighted_sum(perturbation_leaves, normalized)
+    # scale by 1/(σN)
     scale = 1.0 / (sigma * population_size)
-    es_grad_leaves = [leaf * scale for leaf in es_grad_leaves]
-
-    # reconstruct gradient pytree
-    _, treedef = jax.tree.flatten(base_params)
-    es_grad = jax.tree.unflatten(treedef, es_grad_leaves)
+    es_grad = jax.tree.map(lambda g: g * scale, es_grad)
 
     # negate gradient (ES maximizes fitness, optimizer minimizes)
     neg_grad = jax.tree.map(lambda g: -g, es_grad)
@@ -234,6 +222,7 @@ def eggroll_step(
     new_params = optax.apply_updates(base_params, updates)
 
     # metrics
+    es_grad_leaves = jax.tree.leaves(es_grad)
     metrics = {
         "mean_fitness": jnp.mean(fitnesses_arr),
         "max_fitness": jnp.max(fitnesses_arr),

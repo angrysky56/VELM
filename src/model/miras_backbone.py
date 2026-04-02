@@ -477,6 +477,7 @@ class VELMBackbone(eqx.Module):
         ffn_intermediate: int,
         chunk_size: int = 4,
         window_size: int = 512,
+        ae_hidden_dim: int | None = None,
         *,
         key: jax.Array,
     ) -> None:
@@ -490,16 +491,18 @@ class VELMBackbone(eqx.Module):
             ffn_intermediate: SwiGLU intermediate dim
             chunk_size: K tokens per autoregressive step
             window_size: SWA window size
+            ae_hidden_dim: autoencoder embedding dimension (defaults to dim)
             key: PRNG key
         """
         self.dim = dim
+        ae_dim = ae_hidden_dim if ae_hidden_dim is not None else dim
         total_layers = num_miras_layers + num_swa_layers
         keys = jax.random.split(key, total_layers + 2)
 
         # input compression: K embeddings → single vector
         # CALM paper uses 2-layer MLP for this
         self.input_compress = eqx.nn.Linear(
-            chunk_size * dim, dim, use_bias=False, key=keys[0]
+            chunk_size * ae_dim, dim, use_bias=False, key=keys[0]
         )
         self.input_ffn = SwiGLUFFN(dim, ffn_intermediate, key=keys[1])
 

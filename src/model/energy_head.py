@@ -225,13 +225,12 @@ def energy_loss(
     *,
     key: jax.Array,
     num_model_samples: int = 8,
-    num_target_samples: int = 100,
     alpha: float = 1.0,
 ) -> Float[Array, ""]:
     """Compute energy loss for training the generative head.
 
-    Uses Monte Carlo estimation with N model samples and M target samples.
-    Default: N=8, M=100 (from CALM paper ablations).
+    Uses Monte Carlo estimation with N model samples.
+    Default: N=8 (from CALM paper ablations).
 
     Args:
         head: EnergyHead instance
@@ -239,7 +238,6 @@ def energy_loss(
         target_z: (latent_dim,) target latent from CALM encoder
         key: PRNG key
         num_model_samples: N — model-generated samples
-        num_target_samples: M — not used directly (target is deterministic)
         alpha: energy score exponent in (0, 2)
 
     Returns:
