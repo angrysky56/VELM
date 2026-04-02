@@ -1,0 +1,47 @@
+[project]
+name = "velm"
+version = "0.1.0"
+description = "VELM: Vector-Evolution Language Model — A self-evolving, continuous-latent, gradient-free LM architecture"
+readme = "README.md"
+license = { text = "Apache-2.0" }
+requires-python = ">=3.12"
+dependencies = [
+    "jax>=0.9.0",
+    "jaxlib>=0.9.0",
+    "equinox>=0.13.0",
+    "jaxtyping>=0.3.9",
+    "optax>=0.2.0",
+    "numpy>=2.0",
+    "scipy>=1.13",
+    "einops>=0.8",
+    "tqdm>=4.66",
+    "wandb>=0.19",
+    "datasets>=3.0",
+    "tokenizers>=0.21",
+    "transformers>=4.40",
+]
+
+[project.optional-dependencies]
+cuda12 = ["jax-cuda12-plugin>=0.9.0"]
+cuda13 = ["jax-cuda13-plugin>=0.9.0"]
+dev = [
+    "pytest>=8.0",
+    "ruff>=0.8",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src"]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "W", "UP"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
