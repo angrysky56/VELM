@@ -17,12 +17,14 @@ Algorithm:
   3. Update base weights via Adam on the ES gradient
 """
 
+# ruff: noqa: F722, F821
+
+from collections.abc import Callable
+
 import jax
 import jax.numpy as jnp
-import equinox as eqx
 import optax
 from jaxtyping import Array, Float, PyTree
-from typing import Callable
 
 
 def generate_low_rank_perturbation(
@@ -58,7 +60,6 @@ def generate_low_rank_perturbation(
         return (1.0 / jnp.sqrt(rank)) * (a @ b.T)
     else:
         # higher-order tensor: reshape → perturb → reshape back
-        flat_shape = (shape[0], -1)
         total = 1
         for s in shape[1:]:
             total *= s
@@ -183,9 +184,7 @@ def eggroll_step(
 
     def eval_member(member_key: jax.Array):
         """Generate perturbation, evaluate fitness, return both."""
-        perturbed, perturbation = perturb_pytree(
-            base_params, member_key, sigma, rank
-        )
+        perturbed, perturbation = perturb_pytree(base_params, member_key, sigma, rank)
         fitness = fitness_fn(perturbed)
         return fitness, perturbation
 
@@ -228,7 +227,7 @@ def eggroll_step(
         "max_fitness": jnp.max(fitnesses_arr),
         "min_fitness": jnp.min(fitnesses_arr),
         "fitness_std": jnp.std(fitnesses_arr),
-        "grad_norm": jnp.sqrt(sum(jnp.sum(l**2) for l in es_grad_leaves)),
+        "grad_norm": jnp.sqrt(sum(jnp.sum(leaf**2) for leaf in es_grad_leaves)),
         "step": state.step,
     }
 

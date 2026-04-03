@@ -12,11 +12,13 @@ Components:
 The fitness is a black-box scalar — no differentiability required.
 """
 
+# ruff: noqa: F722, F821
+
+from collections.abc import Callable
+
 import jax
 import jax.numpy as jnp
-import equinox as eqx
-from jaxtyping import Array, Float, Int, PyTree
-from typing import Callable
+from jaxtyping import Array, Float, PyTree
 
 
 def quality_fitness(
@@ -65,7 +67,7 @@ def compression_penalty(
     ratio = num_reasoning_chunks / max_chunks
     # penalty increases quadratically above target ratio
     excess = jnp.maximum(ratio - target_ratio, 0.0)
-    return excess ** 2
+    return excess**2
 
 
 def combined_fitness(
@@ -95,9 +97,7 @@ def combined_fitness(
     energy_loss, num_chunks = model_forward(params, batch, key=key)
 
     q_fitness = -energy_loss
-    c_penalty = compression_penalty(
-        num_chunks, max_reasoning_chunks
-    )
+    c_penalty = compression_penalty(num_chunks, max_reasoning_chunks)
 
     total_fitness = q_fitness - compression_weight * c_penalty
 

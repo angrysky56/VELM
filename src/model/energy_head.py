@@ -14,9 +14,11 @@ Trained with energy loss (strictly proper scoring rule).
 The head accounts for ~10% of total model parameters.
 """
 
+# ruff: noqa: F722, F821
+
+import equinox as eqx
 import jax
 import jax.numpy as jnp
-import equinox as eqx
 from jaxtyping import Array, Float
 
 

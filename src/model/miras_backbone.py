@@ -14,11 +14,11 @@ The Miras layer processes sequences recurrently with deep associative memory,
 while SWA layers provide local attention for precise retrieval.
 """
 
+# ruff: noqa: F722, F821
+import equinox as eqx
 import jax
 import jax.numpy as jnp
-import equinox as eqx
 from jaxtyping import Array, Float
-from functools import partial
 
 
 class RMSNorm(eqx.Module):
@@ -32,7 +32,7 @@ class RMSNorm(eqx.Module):
         self.eps = eps
 
     def __call__(self, x: Float[Array, "dim"]) -> Float[Array, "dim"]:
-        rms = jnp.sqrt(jnp.mean(x ** 2) + self.eps)
+        rms = jnp.sqrt(jnp.mean(x**2) + self.eps)
         return (x / rms) * self.weight
 
 
@@ -192,7 +192,7 @@ class MirasMemoryLayer(eqx.Module):
             (new_state, output) tuple
         """
         # compute channel-wise gates
-        eta = self._compute_eta(x_t)    # (dim,) learning rate
+        eta = self._compute_eta(x_t)  # (dim,) learning rate
         alpha = self._compute_alpha(x_t)  # (dim,) retention
 
         # memory readout: predict value from key
@@ -315,7 +315,7 @@ class SlidingWindowAttention(eqx.Module):
             (seq_len, dim) attention output
         """
         seq_len = x.shape[0]
-        scale = self.head_dim ** -0.5
+        scale = self.head_dim**-0.5
 
         # project Q, K, V
         q = jax.vmap(self.wq)(x)  # (T, dim)
@@ -337,8 +337,9 @@ class SlidingWindowAttention(eqx.Module):
 
         # causal mask + sliding window mask
         causal = jnp.tril(jnp.ones((seq_len, seq_len), dtype=jnp.bool_))
-        window = jnp.triu(jnp.ones((seq_len, seq_len), dtype=jnp.bool_),
-                          k=-(self.window_size - 1))
+        window = jnp.triu(
+            jnp.ones((seq_len, seq_len), dtype=jnp.bool_), k=-(self.window_size - 1)
+        )
         mask = causal & window  # (T, T)
 
         scores = jnp.where(mask[None, :, :], scores, -1e9)
@@ -380,7 +381,9 @@ class MirasBlock(eqx.Module):
     norm2: RMSNorm
     ffn: SwiGLUFFN
 
-    def __init__(self, dim: int, num_heads: int, ffn_intermediate: int, *, key: jax.Array) -> None:
+    def __init__(
+        self, dim: int, num_heads: int, ffn_intermediate: int, *, key: jax.Array
+    ) -> None:
         k1, k2 = jax.random.split(key)
         self.norm1 = RMSNorm(dim)
         self.miras = MirasMemoryLayer(dim, num_heads, key=k1)
@@ -523,7 +526,9 @@ class VELMBackbone(eqx.Module):
                 miras_idx += 1
             elif swa_idx < num_swa_layers:
                 s_blocks.append(
-                    SWABlock(dim, num_heads, ffn_intermediate, window_size, key=keys[i + 2])
+                    SWABlock(
+                        dim, num_heads, ffn_intermediate, window_size, key=keys[i + 2]
+                    )
                 )
                 self.block_order.append("swa")
                 swa_idx += 1
@@ -537,7 +542,13 @@ class VELMBackbone(eqx.Module):
                     miras_idx += 1
                 else:
                     s_blocks.append(
-                        SWABlock(dim, num_heads, ffn_intermediate, window_size, key=keys[i + 2])
+                        SWABlock(
+                            dim,
+                            num_heads,
+                            ffn_intermediate,
+                            window_size,
+                            key=keys[i + 2],
+                        )
                     )
                     self.block_order.append("swa")
                     swa_idx += 1

@@ -18,11 +18,16 @@ Selection criterion:
   score(i) = α_i × √nov(i)
 """
 
+# ruff: noqa: F722, F821
+
+from collections.abc import Callable
+from dataclasses import dataclass, field
+
 import jax
 import jax.numpy as jnp
 from jaxtyping import Array, Float, PyTree
-from dataclasses import dataclass, field
-from typing import Callable
+
+from ..training.eggroll import perturb_pytree
 
 
 @dataclass
@@ -156,20 +161,14 @@ class GroupEvolver:
         Returns:
             List of EvolutionTrace for each member
         """
-        from ..training.eggroll import perturb_pytree
-
         traces = []
         member_keys = jax.random.split(key, self.population_size)
 
         for i in range(self.population_size):
             seed = int(member_keys[i][0])
-            perturbed, _ = perturb_pytree(
-                base_params, member_keys[i], sigma, rank
-            )
+            perturbed, _ = perturb_pytree(base_params, member_keys[i], sigma, rank)
 
-            trace = EvolutionTrace(
-                member_id=i, perturbation_seed=seed
-            )
+            trace = EvolutionTrace(member_id=i, perturbation_seed=seed)
 
             # evaluate on each task type
             for task in task_distribution:
@@ -177,9 +176,7 @@ class GroupEvolver:
                 fitness, metrics = fitness_fn(perturbed, task)
                 trace.fitness_scores[task_type] = float(fitness)
                 if "num_chunks" in metrics:
-                    trace.reasoning_lengths[task_type] = float(
-                        metrics["num_chunks"]
-                    )
+                    trace.reasoning_lengths[task_type] = float(metrics["num_chunks"])
 
             traces.append(trace)
 
@@ -203,9 +200,7 @@ class GroupEvolver:
         fitnesses = jnp.array([t.mean_fitness for t in traces])
         novelties = compute_novelty(embeddings, self.novelty_neighbors)
 
-        return performance_novelty_selection(
-            fitnesses, novelties, self.group_size
-        )
+        return performance_novelty_selection(fitnesses, novelties, self.group_size)
 
     def aggregate_experience(
         self,
@@ -249,9 +244,7 @@ class GroupEvolver:
                     avg_reasoning[task_type] = []
                 avg_reasoning[task_type].append(length)
 
-        avg_reasoning = {
-            k: sum(v) / len(v) for k, v in avg_reasoning.items()
-        }
+        avg_reasoning = {k: sum(v) / len(v) for k, v in avg_reasoning.items()}
 
         # collect successful perturbation seeds
         successful_seeds = [t.perturbation_seed for t in parent_traces]
@@ -287,24 +280,25 @@ class GroupEvolver:
         Returns:
             (experience_dict, traces)
         """
-        k1, k2 = jax.random.split(key)
+        k1, _ = jax.random.split(key)
 
         # 1. evaluate population
         traces = self.evaluate_population(
-            base_params, fitness_fn, task_distribution,
-            key=k1, sigma=sigma, rank=rank,
+            base_params,
+            fitness_fn,
+            task_distribution,
+            key=k1,
+            sigma=sigma,
+            rank=rank,
         )
 
         # 2. compute embeddings for novelty (use fitness profile)
         # simple embedding: concatenate fitness scores across tasks
-        task_types = sorted(
-            set().union(*(t.fitness_scores.keys() for t in traces))
-        )
+        task_types = sorted(set().union(*(t.fitness_scores.keys() for t in traces)))
 
-        embeddings = jnp.array([
-            [t.fitness_scores.get(tt, 0.0) for tt in task_types]
-            for t in traces
-        ])
+        embeddings = jnp.array(
+            [[t.fitness_scores.get(tt, 0.0) for tt in task_types] for t in traces]
+        )
 
         # 3. select parent group
         parent_indices = self.select_parents(traces, embeddings)
@@ -365,15 +359,17 @@ def run_evolution(
 
         # GEA: evaluate, select, aggregate
         experience, traces = evolver.evolution_step(
-            params, fitness_fn, task_distribution,
-            key=iter_key, sigma=sigma, rank=rank,
+            params,
+            fitness_fn,
+            task_distribution,
+            key=iter_key,
+            sigma=sigma,
+            rank=rank,
         )
         history.append(experience)
 
         # EGGROLL: update base params using population fitness
-        params = eggroll_step_fn(
-            params, traces, key=eggroll_key, sigma=sigma
-        )
+        params = eggroll_step_fn(params, traces, key=eggroll_key, sigma=sigma)
 
         # log progress
         mean_fit = sum(t.mean_fitness for t in traces) / len(traces)

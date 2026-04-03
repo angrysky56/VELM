@@ -15,9 +15,10 @@ Two modes:
   - Dynamic: monitor info gain per step, terminate when diminishing
 """
 
+# ruff: noqa: F722, F821
+
 import jax
 import jax.numpy as jnp
-import equinox as eqx
 from jaxtyping import Array, Float
 
 
