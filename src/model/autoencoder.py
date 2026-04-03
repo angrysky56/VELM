@@ -11,10 +11,11 @@ Architecture:
 Trained with cross-entropy reconstruction + KL clipping regularization.
 Achieves >99.9% token reconstruction accuracy.
 """
+# ruff: noqa: F722, F821
 
+import equinox as eqx
 import jax
 import jax.numpy as jnp
-import equinox as eqx
 from jaxtyping import Array, Float, Int
 
 
