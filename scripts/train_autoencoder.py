@@ -127,7 +127,10 @@ def main():
         decay_steps=args.steps,
         end_value=args.lr * 0.1,
     )
-    optimizer = optax.adamw(schedule, weight_decay=0.01)
+    optimizer = optax.chain(
+        optax.clip_by_global_norm(1.0),  # prevent gradient explosion → NaN
+        optax.adamw(schedule, weight_decay=0.01),
+    )
     opt_state = optimizer.init(eqx.filter(model, eqx.is_array))
 
     # training loop

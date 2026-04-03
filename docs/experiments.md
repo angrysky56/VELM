@@ -11,11 +11,13 @@ Phase 1 can run on a single RTX 3060 12GB. Later phases require more compute.
 **Goal:** Train and validate the CALM autoencoder independently.
 
 **Setup:**
-- Dataset: Pile uncopyrighted (~230B tokens available, use 10B subset)
-- Tokenizer: Llama 3 (128K vocab)
+- Dataset: OpenWebMath (streamed, ~1M tokens for constrained hardware)
+- Tokenizer: Qwen3.5 (248K vocab, 201 languages)
 - K = 4 (token chunk size)
-- Latent dimension l = 128
+- Latent dimension l = 64 (gpu_12gb config), l = 128 (full-scale configs)
 - Regularization: KL clipping (β=0.001), DropToken, DropLatent
+- Stability: logvar clamped to [-20, 2], gradient clipping (norm=1.0),
+  logit scaling by 1/√d (required for 248K vocab numerical stability)
 
 **Metrics:**
 - Reconstruction accuracy (target: >99.9%)

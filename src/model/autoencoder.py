@@ -119,7 +119,9 @@ class Encoder(eqx.Module):
 
         # 5. project to latent: mu and logvar
         mu = self.to_mu(h_refined)  # (l,)
-        logvar = self.to_logvar(h_refined)  # (l,)
+        logvar_raw = self.to_logvar(h_refined)  # (l,)
+        # clamp logvar to prevent exp() overflow — critical for stability
+        logvar = jnp.clip(logvar_raw, -20.0, 2.0)
 
         # reparameterization trick during training
         if training and key is not None:
@@ -206,8 +208,9 @@ class Decoder(eqx.Module):
         h_tokens = jax.vmap(self.token_ffn)(h_tokens)  # (K, d)
 
         # 6. project to vocab logits using tied embeddings
-        # logits_i = h_tokens[i] @ embedding_matrix.T
-        logits = h_tokens @ embedding_matrix.T  # (K, vocab)
+        # scale by 1/sqrt(d) to prevent large logits with 248K vocab
+        scale = jnp.sqrt(jnp.float32(self.hidden_dim))
+        logits = (h_tokens @ embedding_matrix.T) / scale  # (K, vocab)
 
         return logits
 
@@ -311,7 +314,9 @@ class CALMAutoencoder(eqx.Module):
 
         # KL divergence with clipping (from CALM paper)
         # KL(q(z|x) || N(0,I)) = -0.5 * sum(1 + logvar - mu^2 - exp(logvar))
-        kl_per_dim = -0.5 * (1.0 + logvar - mu**2 - jnp.exp(logvar))
+        # logvar is already clamped in encoder, but belt-and-suspenders:
+        safe_logvar = jnp.clip(logvar, -20.0, 2.0)
+        kl_per_dim = -0.5 * (1.0 + safe_logvar - mu**2 - jnp.exp(safe_logvar))
         kl_raw = jnp.sum(kl_per_dim)
 
         # clip KL: only penalize dimensions that exceed the clip threshold
