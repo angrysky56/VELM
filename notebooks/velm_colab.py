@@ -19,14 +19,15 @@ Tokenizer: Qwen3.5 (248K vocab, 201 languages)
 # 4. Evaluate & save checkpoints
 
 # %% — 0. Environment Setup
-# !pip install -q "jax[cuda12]" equinox jaxtyping optax einops tqdm
-# !pip install -q datasets tokenizers transformers
+!pip install -q "jax[cuda12]" equinox jaxtyping optax einops tqdm
+!pip install -q datasets tokenizers transformers
 
 import os
 import sys
 
 import jax
 import jax.numpy as jnp
+
 print(f"JAX {jax.__version__} | backend: {jax.default_backend()}")
 print(f"Devices: {jax.devices()}")
 if jax.default_backend() != "gpu":
@@ -41,18 +42,25 @@ if os.path.exists(os.path.join(VELM_DIR, "src")):
     os.chdir(VELM_DIR)
     sys.path.insert(0, VELM_DIR)
 
-from src.model.autoencoder import CALMAutoencoder, batch_ae_loss, reconstruction_accuracy
+from src.model.autoencoder import (
+    CALMAutoencoder,
+    batch_ae_loss,
+    reconstruction_accuracy,
+)
+from src.model.config import CONFIGS, DEFAULT_TOKENIZER
 from src.model.energy_head import EnergyHead, energy_score
 from src.model.miras_backbone import VELMBackbone
-from src.model.config import CONFIGS, DEFAULT_TOKENIZER
 from src.training.eggroll import perturb_pytree  # used in Phase 2 custom ES loop
+
 print("✓ VELM modules imported")
+
+import time
 
 # %% — 2. Hardware-adaptive config
 import equinox as eqx
-import optax
 import numpy as np
-import time
+import optax
+
 
 # detect GPU memory and pick profile
 def detect_hardware() -> dict:
@@ -269,6 +277,7 @@ eqx.tree_serialise_leaves("checkpoints/calm_ae_final.eqx", model)
 
 # %% — 6. Plot AE training curves
 import matplotlib
+
 matplotlib.use("Agg")  # headless
 import matplotlib.pyplot as plt
 
@@ -585,6 +594,7 @@ eqx.tree_serialise_leaves("checkpoints/backbone_eggroll.eqx", final_bb)
 eqx.tree_serialise_leaves("checkpoints/energy_head_eggroll.eqx", final_hd)
 
 import json  # noqa: E402
+
 with open("checkpoints/backbone_meta.json", "w", encoding="utf-8") as f:
     json.dump({"config": CONFIG_NAME, "vocab_size": VOCAB_SIZE,
                "tokenizer": DEFAULT_TOKENIZER,
