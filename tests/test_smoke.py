@@ -258,7 +258,56 @@ def test_gea_novelty():
     print("  GEA novelty/selection: OK")
 
 
+def test_gea_eggroll_bridge():
+    """GEA-EGGROLL integration: traces → experience-weighted update."""
+    import optax
+
+    from src.evolution.gea_eggroll import (
+        EvolutionTrace,
+        experience_weighted_eggroll_step,
+    )
+
+    key = jax.random.PRNGKey(9)
+    params = {"w": jax.random.normal(key, (DIM, DIM))}
+
+    # create mock traces (simulating GEA population evaluation)
+    traces = []
+    for i in range(8):
+        trace = EvolutionTrace(
+            member_id=i,
+            perturbation_seed=42 + i,
+            fitness_scores={"math": float(i * 0.1), "general": float(i * 0.05)},
+        )
+        traces.append(trace)
+
+    optimizer = optax.adam(1e-2)
+    opt_state = optimizer.init(params)
+
+    # run the bridge function
+    new_params, new_opt_state, metrics = experience_weighted_eggroll_step(
+        params,
+        traces,
+        key=key,
+        optimizer=optimizer,
+        opt_state=opt_state,
+        sigma=0.01,
+        rank=1,
+        parent_indices=[6, 7],  # best performers
+        parent_bias=0.3,
+    )
+
+    assert new_params["w"].shape == (DIM, DIM)
+    assert "mean_fitness" in metrics
+    assert "max_fitness" in metrics
+    assert "valid_members" in metrics
+    assert metrics["parent_bias_applied"] is True
+    # params should have changed
+    assert not jnp.allclose(params["w"], new_params["w"])
+    print("  GEA-EGGROLL bridge: OK")
+
+
 def run_all():
+
     """Run all smoke tests and report results."""
     tests = [
         ("Autoencoder encode/decode", test_autoencoder_encode_decode),
@@ -271,6 +320,7 @@ def run_all():
         ("EGGROLL step", test_eggroll_step),
         ("CIB budget controller", test_cib_budget),
         ("GEA novelty/selection", test_gea_novelty),
+        ("GEA-EGGROLL bridge", test_gea_eggroll_bridge),
     ]
 
     print("=" * 60)

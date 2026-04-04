@@ -373,7 +373,223 @@ try:
 except Exception:  # pylint: disable=broad-except
     pass
 
-# %% — 9. Quick evaluation: reconstruction + generation quality
+# %% — 8.5. EGGROLL Diagnostics Report
+from src.training.diagnostics import EGGROLLDiagnostics  # noqa: E402
+
+diag = EGGROLLDiagnostics(plateau_window=50, plateau_threshold=0.001)
+# backfill from egg_history (each entry was logged at step % 100)
+for i, mf in enumerate(egg_history["mean_fitness"]):
+    step_num = (i + 1) * 100
+    diag.log_step(
+        step_num,
+        trainable,
+        {
+            "mean_fitness": mf,
+            "max_fitness": egg_history["max_fitness"][i],
+            "fitness_std": 0.0,  # not tracked during Phase 2
+            "grad_norm": egg_history["grad_norm"][i],
+        },
+    )
+diag.report()
+if diag.warnings:
+    print("\n⚠ Active warnings:")
+    for w in diag.warnings:
+        print(f"  - {w}")
+
+# %% — 9. Phase 3: GEA-EGGROLL Group Evolution
+from src.evolution.gea_eggroll import (  # noqa: E402
+    GroupEvolver,
+    experience_weighted_eggroll_step,
+)
+
+# --- GEA configuration (hw-adaptive) ---
+GEA_ITERATIONS = 10         # quality over speed
+GEA_POP = min(HW["pop"], 32)  # population per GEA generation
+GEA_GROUP = 5                # parent group size (K in GEA paper)
+GEA_SIGMA = 0.01             # perturbation scale (match EGGROLL Phase 2)
+GEA_BIAS = 0.3               # parent-direction bias strength
+
+print(f"\nPhase 3: GEA Group Evolution — {GEA_ITERATIONS} iterations")
+print(f"  population: {GEA_POP} | group: {GEA_GROUP} | σ: {GEA_SIGMA}")
+print("=" * 60)
+
+# Build a task distribution from loaded data domains
+# Create a simple fitness function that evaluates backbone + head on a task
+def gea_fitness_fn(params, task):
+    """Evaluate fitness on a specific task domain.
+
+    Returns (fitness_scalar, metrics_dict) for GEA trace recording.
+    """
+    task_type = task.get("type", "default")
+
+    # assemble full models from params
+    bb = eqx.combine(params["backbone"],
+                      eqx.filter(backbone, lambda x: not eqx.is_array(x)))
+    hd = eqx.combine(params["head"],
+                      eqx.filter(head, lambda x: not eqx.is_array(x)))
+
+    # sample a small batch from the specific domain
+    domain_key = jax.random.PRNGKey(hash(task_type) % (2**31))
+    # select chunks by domain label if available
+    domain_idx = [
+        i for i, lab in enumerate(
+            getattr(data_loader, "chunk_labels", [])
+        ) if lab == task_type
+    ] if hasattr(data_loader, "chunk_labels") else []
+
+    if domain_idx:
+        sample_idx = np.array(domain_idx[:EVAL_BATCH], dtype=np.int32)
+        if len(sample_idx) < EVAL_BATCH:
+            # pad with random repeats from domain
+            extra = np.random.choice(domain_idx, EVAL_BATCH - len(sample_idx))
+            sample_idx = np.concatenate([sample_idx, extra.astype(np.int32)])
+    else:
+        # fallback to random chunks
+        sample_idx = jax.random.randint(domain_key, (EVAL_BATCH,), 0, num_chunks)
+
+    batch_tokens = jnp.array(all_chunks[np.array(sample_idx)])
+
+    # encode chunks via frozen AE
+    tgt_z = jax.vmap(lambda c: frozen_ae.encode(c, training=False)[0])(batch_tokens)
+
+    # compress input for backbone
+    def compress(chunk):
+        embs = jax.vmap(frozen_ae.embedding)(chunk)
+        return bb.compress_input(embs)
+    inp_seq = jax.vmap(compress)(batch_tokens)
+
+    # backbone forward
+    hid, _ = bb(inp_seq)
+
+    # energy loss
+    hid_in, z_target = hid[:-1], tgt_z[1:]
+
+    def pos_loss(h, z_t):
+        samples = hd(h, key=jax.random.PRNGKey(0), num_samples=4)
+        return energy_score(samples, z_t)
+
+    loss_vals = jax.vmap(pos_loss)(hid_in, z_target)
+    fitness = -jnp.mean(loss_vals)
+    fitness = jnp.where(jnp.isfinite(fitness), fitness, -1e6)
+
+    metrics = {"energy_loss": float(-fitness), "num_chunks": EVAL_BATCH}
+    return float(fitness), metrics
+
+
+# Task distribution: one per data domain
+# Use simple domain labels from the loaded data
+task_distribution = [
+    {"type": "math"},
+    {"type": "general"},
+    {"type": "narrative"},
+]
+
+# Try to build from actual data loader if available
+try:
+    data_loader  # noqa: F821
+    task_distribution = data_loader.get_task_distribution()
+    if not task_distribution:
+        task_distribution = [{"type": "default"}]
+except NameError:
+    # data_loader not defined — use default tasks
+    task_distribution = [{"type": "default"}]
+
+# Initialize GEA optimizer (separate from EGGROLL Phase 2)
+gea_optimizer = optax.chain(
+    optax.clip_by_global_norm(1.0),
+    optax.adam(1e-3),
+)
+gea_opt_state = gea_optimizer.init(eqx.filter(backbone, eqx.is_array))
+# We need opt_state matching the trainable pytree shape
+gea_opt_state = gea_optimizer.init(trainable)
+
+# Initialize GroupEvolver
+evolver = GroupEvolver(
+    population_size=GEA_POP,
+    group_size=GEA_GROUP,
+)
+
+# GEA evolution loop
+gea_history = {"mean_fitness": [], "max_fitness": [], "parent_sizes": []}
+gea_start = time.time()
+
+for gea_iter in range(1, GEA_ITERATIONS + 1):
+    key, iter_key, eggroll_key = jax.random.split(key, 3)
+
+    # GEA evaluate + select
+    experience, traces = evolver.evolution_step(
+        trainable,
+        gea_fitness_fn,
+        task_distribution,
+        key=iter_key,
+        sigma=GEA_SIGMA,
+        rank=1,
+    )
+
+    # extract unique parent indices
+    parent_indices = list(experience.get("task_champions", {}).values())
+    seen = set()
+    unique_parents = []
+    for idx in parent_indices:
+        if idx not in seen:
+            seen.add(idx)
+            unique_parents.append(idx)
+
+    # experience-biased EGGROLL update
+    trainable, gea_opt_state, step_metrics = experience_weighted_eggroll_step(
+        trainable,
+        traces,
+        key=eggroll_key,
+        optimizer=gea_optimizer,
+        opt_state=gea_opt_state,
+        sigma=GEA_SIGMA,
+        rank=1,
+        parent_indices=unique_parents if unique_parents else None,
+        parent_bias=GEA_BIAS,
+    )
+
+    mf = step_metrics["mean_fitness"]
+    xf = step_metrics["max_fitness"]
+    gea_history["mean_fitness"].append(mf)
+    gea_history["max_fitness"].append(xf)
+    gea_history["parent_sizes"].append(len(unique_parents))
+
+    elapsed = time.time() - gea_start
+    print(f"  GEA {gea_iter:>3}/{GEA_ITERATIONS} | "
+          f"mean: {mf:.4f} | best: {xf:.4f} | "
+          f"parents: {len(unique_parents)} | {elapsed/60:.0f}m")
+
+gea_elapsed = time.time() - gea_start
+print(f"\nPhase 3 done: {gea_elapsed/60:.1f}m")
+
+# save evolved params
+final_bb = eqx.combine(trainable["backbone"],
+                         eqx.filter(backbone, lambda x: not eqx.is_array(x)))
+final_hd = eqx.combine(trainable["head"],
+                         eqx.filter(head, lambda x: not eqx.is_array(x)))
+
+eqx.tree_serialise_leaves("checkpoints/backbone_gea.eqx", final_bb)
+eqx.tree_serialise_leaves("checkpoints/energy_head_gea.eqx", final_hd)
+print("✓ Saved: checkpoints/backbone_gea.eqx + energy_head_gea.eqx")
+
+# %% — 9.5. Plot GEA evolution curves
+fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+axes[0].plot(gea_history["mean_fitness"], label="mean", marker="o")
+axes[0].plot(gea_history["max_fitness"], label="best", marker="s")
+axes[0].set_title("GEA Fitness Over Iterations")
+axes[0].set_xlabel("GEA Iteration"); axes[0].legend()
+axes[1].bar(range(len(gea_history["parent_sizes"])), gea_history["parent_sizes"])
+axes[1].set_title("Unique Parents Per Iteration")
+axes[1].set_xlabel("GEA Iteration"); axes[1].set_ylabel("# Parents")
+plt.tight_layout()
+plt.savefig("gea_evolution.png", dpi=150, bbox_inches="tight")
+print("Saved: gea_evolution.png")
+try:
+    plt.show()
+except Exception:  # pylint: disable=broad-except
+    pass
+
+# %% — 10. Quick evaluation: reconstruction + generation quality
 print("\n" + "=" * 60)
 print("Evaluation")
 print("=" * 60)
@@ -395,7 +611,7 @@ for i in range(5):
     match_char = "✓" if np.array_equal(original, np.array(reconstructed)) else "✗"
     print(f"  {match_char} [{original_text[:40]:>40s}] → [{recon_text[:40]:<40s}]")
 
-# check backbone next-vector prediction quality
+# check backbone next-vector prediction quality (using GEA-evolved model)
 print("\nBackbone next-vector prediction (energy loss on 100 pairs):")
 key, pred_key = jax.random.split(key)
 test_idx = jax.random.randint(pred_key, (100,), 0, num_chunks)
@@ -416,7 +632,7 @@ losses = jax.vmap(measure_loss)(h_in, z_tgt, pred_keys)
 print(f"  Mean energy loss: {float(jnp.mean(losses)):.4f}")
 print(f"  Std energy loss:  {float(jnp.std(losses)):.4f}")
 
-# %% — 10. Summary & Download
+# %% — 11. Summary & Download
 print("\n" + "=" * 60)
 print("✅ VELM Training Complete!")
 print("=" * 60)
@@ -424,24 +640,30 @@ print(f"Config:      {CONFIG_NAME}")
 print(f"Tokenizer:   {DEFAULT_TOKENIZER} (vocab={VOCAB_SIZE:,})")
 print(f"Dataset:     OpenWebMath ({all_chunks.shape[0]:,} chunks)")
 print(f"AE accuracy: {final_acc:.4%}")
+print(f"GEA iters:   {GEA_ITERATIONS} (bias={GEA_BIAS})")
 print("\nCheckpoints saved:")
 print("  checkpoints/calm_ae_best.eqx      — best autoencoder")
 print("  checkpoints/calm_ae_final.eqx     — final autoencoder")
 print("  checkpoints/backbone_eggroll.eqx  — EGGROLL backbone")
-print("  checkpoints/energy_head_eggroll.eqx — energy head")
+print("  checkpoints/energy_head_eggroll.eqx — energy head (EGGROLL)")
+print("  checkpoints/backbone_gea.eqx      — GEA-evolved backbone")
+print("  checkpoints/energy_head_gea.eqx   — GEA-evolved energy head")
 print("  checkpoints/*.json                — metadata for loading")
 print("\nTraining curves:")
 print("  ae_training_curves.png")
 print("  eggroll_training.png")
+print("  gea_evolution.png")
 
 # Colab download helper
 try:
-    from google.colab import files
+    from google.colab import files  # noqa: E402
     for f in ["checkpoints/calm_ae_best.eqx", "checkpoints/calm_ae_best.json",
               "checkpoints/backbone_eggroll.eqx", "checkpoints/energy_head_eggroll.eqx",
+              "checkpoints/backbone_gea.eqx", "checkpoints/energy_head_gea.eqx",
               "checkpoints/backbone_meta.json",
-              "ae_training_curves.png", "eggroll_training.png"]:
+              "ae_training_curves.png", "eggroll_training.png", "gea_evolution.png"]:
         if os.path.exists(f):
             files.download(f)
 except ImportError:
     print("\nNot on Colab — checkpoints are in ./checkpoints/")
+

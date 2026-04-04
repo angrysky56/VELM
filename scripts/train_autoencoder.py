@@ -13,19 +13,18 @@ Hardware: Single RTX 3060 12GB (~10 GPU-hours)
 """
 
 import argparse
+import sys
 import time
 from pathlib import Path
 
-import jax
-import jax.numpy as jnp
-import optax
 import equinox as eqx
+import jax
+import optax
 
-import sys
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from src.model.autoencoder import CALMAutoencoder, batch_ae_loss, reconstruction_accuracy
-from src.model.config import CONFIGS
+from src.model.config import CONFIGS, QWEN35_VOCAB_SIZE
 
 
 def create_dummy_batch(
@@ -103,7 +102,7 @@ def main():
     key, init_key = jax.random.split(key)
 
     model = CALMAutoencoder(
-        vocab_size=128_256,
+        vocab_size=QWEN35_VOCAB_SIZE,
         chunk_size=cfg["chunk_size_k"],
         hidden_dim=512,
         latent_dim=cfg["latent_dim"],
@@ -142,7 +141,7 @@ def main():
 
         # TODO: replace with real data loader
         batch = create_dummy_batch(
-            batch_key, args.batch_size, cfg["chunk_size_k"], 128_256
+            batch_key, args.batch_size, cfg["chunk_size_k"], QWEN35_VOCAB_SIZE
         )
 
         model, opt_state, metrics = train_step(
