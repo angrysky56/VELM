@@ -162,8 +162,10 @@ for lab, cnt in sorted(label_counts.items()):
 
 # %% — 5. Phase 1: Train CALM Autoencoder
 HIDDEN_DIM = cfg.get("ae_hidden_dim", 256)
-LATENT_DIM = cfg["latent_dim"]
+LATENT_DIM = cfg["latent_dim"]  # now 128 (was 64 — too tight for 248K vocab)
 FFN_DIM = cfg.get("ae_ffn_intermediate", 512)
+KL_CLIP = cfg.get("ae_kl_clip", 0.5)    # paper uses λ_KL=0.5
+KL_WEIGHT = cfg.get("ae_kl_weight", 0.001)  # paper uses β=0.001
 BATCH_SIZE = HW["batch"]
 AE_STEPS = HW["ae_steps"]
 LR = 3e-4
@@ -177,8 +179,8 @@ model = CALMAutoencoder(
     hidden_dim=HIDDEN_DIM,
     latent_dim=LATENT_DIM,
     ffn_intermediate=FFN_DIM,
-    kl_weight=0.001,
-    kl_clip=1.0,
+    kl_weight=KL_WEIGHT,
+    kl_clip=KL_CLIP,  # was 1.0 — paper says 0.5 prevents posterior collapse
     key=k_init,
 )
 num_params = sum(x.size for x in jax.tree.leaves(eqx.filter(model, eqx.is_array)))
@@ -285,8 +287,8 @@ except Exception:  # pylint: disable=broad-except
 # %% — 7. Phase 2: EGGROLL Backbone Training (gradient-free)
 POP_SIZE = HW["pop"]
 EGGROLL_STEPS = HW["egg_steps"]
-SIGMA = 0.01
-EGG_LR = 1e-3
+SIGMA = cfg.get("eggroll_sigma", 0.001)  # was 0.01 — 10x too large, caused weight explosion
+EGG_LR = cfg.get("eggroll_lr", 3e-4)    # was 1e-3 — too aggressive for noisy ES gradients
 EVAL_BATCH = 32
 
 key = jax.random.PRNGKey(123)
@@ -350,14 +352,17 @@ def evaluate_member(base_params, member_key, batch):
     # energy loss: predict z_{i+1} from h_i
     hid_in, z_target = hid[:-1], tgt_z[1:]
     def pos_loss(h, z_t):
-        samples = hd(h, key=jax.random.PRNGKey(0), num_samples=4)
+        samples = hd(h, key=jax.random.PRNGKey(0), num_samples=8)  # paper recommends N=8
         return energy_score(samples, z_t)
     loss_vals = jax.vmap(pos_loss)(hid_in, z_target)
     fitness = -jnp.mean(loss_vals)
     return jnp.where(jnp.isfinite(fitness), fitness, -1e6), perturbation
 
-# optimizer for ES gradient updates
-eggroll_opt = optax.adam(EGG_LR)
+# optimizer for ES gradient updates — clip to prevent weight explosion
+eggroll_opt = optax.chain(
+    optax.clip_by_global_norm(1.0),  # prevents the exponential divergence seen in v1
+    optax.adam(EGG_LR),
+)
 eggroll_opt_state = eggroll_opt.init(trainable)
 
 # --- Warmup: compile the evaluation function ONCE before the loop ---
@@ -436,6 +441,15 @@ for step in range(1, EGGROLL_STEPS + 1):
         print(f"  step {step:>5}/{EGGROLL_STEPS} | "
               f"mean_f: {mf:.4f} | max_f: {xf:.4f} | "
               f"grad: {gn:.4f} | {elapsed/60:.0f}m")
+
+        # divergence detection — fitness should improve (get less negative)
+        if len(egg_history["mean_fitness"]) >= 5:
+            recent = egg_history["mean_fitness"][-5:]
+            if recent[-1] < min(recent[:-1]) * 10:  # 10x worse = diverging
+                print(f"  ⚠ DIVERGENCE DETECTED at step {step} — stopping EGGROLL")
+                print(f"    Fitness went from {recent[0]:.2f} to {recent[-1]:.2f}")
+                print(f"    This usually means σ is too large or lr is too high.")
+                break
 
     # checkpoint every 500 steps
     if step % 500 == 0:
@@ -581,7 +595,7 @@ def gea_fitness_fn(params, task):
     hid_in, z_target = hid[:-1], tgt_z[1:]
 
     def pos_loss(h, z_t):
-        samples = hd(h, key=jax.random.PRNGKey(0), num_samples=4)
+        samples = hd(h, key=jax.random.PRNGKey(0), num_samples=8)  # paper recommends N=8
         return energy_score(samples, z_t)
 
     loss_vals = jax.vmap(pos_loss)(hid_in, z_target)

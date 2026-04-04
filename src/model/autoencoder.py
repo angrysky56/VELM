@@ -106,9 +106,10 @@ class Encoder(eqx.Module):
         h = jax.vmap(self.token_ffn)(token_embeddings)  # (K, d)
 
         # 2. DropToken: randomly zero out token embeddings during training
+        #    CALM paper uses p=0.15 dropout rate → keep prob = 0.85
         if training and key is not None:
             key, drop_key = jax.random.split(key)
-            token_mask = jax.random.bernoulli(drop_key, 0.9, shape=(k, 1))
+            token_mask = jax.random.bernoulli(drop_key, 0.85, shape=(k, 1))
             h = h * token_mask
 
         # 3. flatten K×d → d
@@ -209,9 +210,9 @@ class Decoder(eqx.Module):
         h_tokens = jax.vmap(self.token_ffn)(h_tokens)  # (K, d)
 
         # 6. project to vocab logits using tied embeddings
-        # scale by 1/sqrt(d) to prevent large logits with 248K vocab
-        scale = jnp.sqrt(jnp.float32(self.hidden_dim))
-        logits = (h_tokens @ embedding_matrix.T) / scale  # (K, vocab)
+        # CALM paper uses raw dot product — no 1/sqrt(d) scaling here
+        # (scaling is for attention QK dots, not final logit projection)
+        logits = h_tokens @ embedding_matrix.T  # (K, vocab)
 
         return logits
 
@@ -241,7 +242,7 @@ class CALMAutoencoder(eqx.Module):
         latent_dim: int = 128,
         ffn_intermediate: int = 1024,
         kl_weight: float = 0.001,
-        kl_clip: float = 1.0,
+        kl_clip: float = 0.5,  # CALM paper λ_KL = 0.5 (prevents posterior collapse)
         *,
         key: jax.Array,
     ) -> None:

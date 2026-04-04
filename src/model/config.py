@@ -18,6 +18,8 @@ DEFAULT_TOKENIZER = "Qwen/Qwen3.5-0.8B"
 # Model size configurations
 CONFIGS: dict[str, dict] = {
     # RTX 3060 12GB / T4 16GB — functional experiments
+    # latent_dim=128 matches CALM paper optimal (Fig 7); 64 was too tight
+    # for 248K vocab, causing ~97% accuracy ceiling instead of >99.9%
     "gpu_12gb": {
         "num_layers": 8,
         "hidden_dim": 256,
@@ -27,9 +29,13 @@ CONFIGS: dict[str, dict] = {
         "ffn_intermediate": 512,
         "energy_head_blocks": 2,
         "chunk_size_k": 4,
-        "latent_dim": 64,
+        "latent_dim": 128,         # was 64 — paper optimal is 128 for K=4
         "ae_hidden_dim": 256,
         "ae_ffn_intermediate": 512,
+        "ae_kl_clip": 0.5,         # paper uses λ_KL=0.5, not 1.0
+        "ae_kl_weight": 0.001,     # paper uses β=0.001
+        "eggroll_sigma": 0.001,    # paper uses σ=0.001, NOT 0.01
+        "eggroll_lr": 3e-4,        # conservative for noisy ES gradients
     },
     # Smoke test / CI — minimal viable forward pass
     "smoke": {
