@@ -284,6 +284,113 @@ try:
 except Exception:  # pylint: disable=broad-except
     pass
 
+# %% — 6.5. Phase 1.5: Continue AE Training (warm restart)
+# Skip this cell if Phase 1 already hit >99.9%.
+# Otherwise, load the best checkpoint and continue with a fresh LR schedule.
+# The model was still improving at 100K steps — more training helps.
+
+CONTINUE_AE = True  # set False to skip continuation
+CONTINUE_STEPS = 100_000
+CONTINUE_LR = 1e-4  # lower peak than Phase 1 (was 3e-4)
+TARGET_ACC = 0.999   # stop when we hit this
+
+if CONTINUE_AE and best_acc < TARGET_ACC:
+    print(f"\nPhase 1.5: Continue AE training — best so far: {best_acc:.4%}")
+    print(f"  Loading best checkpoint, {CONTINUE_STEPS:,} more steps, peak LR={CONTINUE_LR}")
+    print("=" * 60)
+
+    # load best checkpoint
+    model = eqx.tree_deserialise_leaves("checkpoints/calm_ae_best.eqx", model)
+    print(f"  ✓ Loaded best checkpoint (acc={best_acc:.4%})")
+
+    # fresh optimizer with lower LR and longer warmup
+    cont_warmup = min(1000, CONTINUE_STEPS // 10)
+    cont_schedule = optax.warmup_cosine_decay_schedule(
+        init_value=0.0, peak_value=CONTINUE_LR,
+        warmup_steps=cont_warmup, decay_steps=CONTINUE_STEPS,
+        end_value=CONTINUE_LR * 0.01,  # decay to 1e-6
+    )
+    cont_optimizer = optax.chain(
+        optax.clip_by_global_norm(1.0),
+        optax.adamw(cont_schedule, weight_decay=0.01),
+    )
+    opt_state = cont_optimizer.init(eqx.filter(model, eqx.is_array))
+
+    # redefine train_step with the new optimizer
+    @eqx.filter_jit
+    def cont_train_step(mdl, state, batch_chunk, key_step):
+        def loss_fn(m):
+            return batch_ae_loss(m, batch_chunk, key=key_step)
+        (loss_val, metrics_val), grads = eqx.filter_value_and_grad(
+            loss_fn, has_aux=True)(mdl)
+        updates, new_opt = cont_optimizer.update(grads, state, mdl)
+        new_model = eqx.apply_updates(mdl, updates)
+        return new_model, new_opt, loss_val, metrics_val
+
+    cont_history = {"recon": [], "kl": [], "accuracy": []}
+    cont_start = time.time()
+    hit_target = False
+
+    for step in range(1, CONTINUE_STEPS + 1):
+        key, batch_key, step_key = jax.random.split(key, 3)
+        indices = jax.random.randint(batch_key, (BATCH_SIZE,), 0, num_chunks)
+        batch = jnp.array(all_chunks[indices])
+        model, opt_state, loss, metrics = cont_train_step(
+            model, opt_state, batch, step_key)
+
+        if step % 500 == 0:
+            elapsed = time.time() - cont_start
+            rl = float(metrics["recon_loss"])
+            kl = float(metrics["kl_loss"])
+            cont_history["recon"].append(rl)
+            cont_history["kl"].append(kl)
+            print(f"  step {step:>6}/{CONTINUE_STEPS} | recon: {rl:.4f} | "
+                  f"kl: {kl:.4f} | {step/elapsed:.1f} steps/s | "
+                  f"{elapsed/60:.0f}m")
+
+        if step % 2000 == 0:
+            key, eval_key = jax.random.split(key)
+            eval_idx = jax.random.randint(eval_key, (512,), 0, num_chunks)
+            eval_batch = jnp.array(all_chunks[eval_idx])
+            acc = float(eval_accuracy(model, eval_batch))
+            cont_history["accuracy"].append(acc)
+            print(f"  >> Reconstruction accuracy: {acc:.4%}")
+            if acc > best_acc:
+                best_acc = acc
+                eqx.tree_serialise_leaves("checkpoints/calm_ae_best.eqx", model)
+                import json
+                with open("checkpoints/calm_ae_best.json", "w",
+                          encoding="utf-8") as f:
+                    json.dump({"config": CONFIG_NAME, "vocab_size": VOCAB_SIZE,
+                               "tokenizer": DEFAULT_TOKENIZER,
+                               "step": 100_000 + step, "accuracy": acc,
+                               "phase": "1.5_continuation"}, f, indent=2)
+                print(f"  >> New best! Saved checkpoint (acc={acc:.4%})")
+            if acc >= TARGET_ACC:
+                print(f"  🎯 TARGET {TARGET_ACC:.1%} reached at step {step}!")
+                hit_target = True
+                break
+
+            # plateau detection: if no improvement in last 5 evals, stop
+            if len(cont_history["accuracy"]) >= 6:
+                last_5 = cont_history["accuracy"][-5:]
+                if max(last_5) - min(last_5) < 0.001:
+                    print(f"  ⚠ Plateau detected (last 5 evals within 0.1%)")
+                    print(f"    Consider increasing hidden_dim to 384 or 512")
+                    break
+
+    cont_elapsed = time.time() - cont_start
+    eqx.tree_serialise_leaves("checkpoints/calm_ae_final.eqx", model)
+    print(f"\nPhase 1.5 done: {cont_elapsed/3600:.2f}h | best accuracy: {best_acc:.4%}")
+    if not hit_target and best_acc < TARGET_ACC:
+        print(f"  ⚠ Did not reach {TARGET_ACC:.1%}. The hidden_dim=256 may be too")
+        print(f"    small for 248K vocab. Set hidden_dim=384 in config and retrain.")
+else:
+    if best_acc >= TARGET_ACC:
+        print(f"\n✓ AE already at {best_acc:.4%} — skipping Phase 1.5")
+    else:
+        print(f"\n⏭ Phase 1.5 skipped (CONTINUE_AE=False)")
+
 # %% — 7. Phase 2: EGGROLL Backbone Training (gradient-free)
 POP_SIZE = HW["pop"]
 EGGROLL_STEPS = HW["egg_steps"]

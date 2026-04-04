@@ -37,6 +37,26 @@ CONFIGS: dict[str, dict] = {
         "eggroll_sigma": 0.001,    # paper uses σ=0.001, NOT 0.01
         "eggroll_lr": 3e-4,        # conservative for noisy ES gradients
     },
+    # RTX 3060 12GB / T4 16GB — higher capacity AE for 248K vocab
+    # Use this if gpu_12gb plateaus below 99.9% reconstruction accuracy.
+    # The 248K Qwen vocab needs more hidden_dim than CALM's 32K Llama vocab.
+    "gpu_12gb_v2": {
+        "num_layers": 8,
+        "hidden_dim": 256,
+        "num_heads": 8,
+        "miras_layers": 4,
+        "swa_layers": 4,
+        "ffn_intermediate": 512,
+        "energy_head_blocks": 2,
+        "chunk_size_k": 4,
+        "latent_dim": 128,
+        "ae_hidden_dim": 384,      # 256→384: more capacity for 248K vocab logits
+        "ae_ffn_intermediate": 768, # scale FFN proportionally
+        "ae_kl_clip": 0.5,
+        "ae_kl_weight": 0.001,
+        "eggroll_sigma": 0.001,
+        "eggroll_lr": 3e-4,
+    },
     # Smoke test / CI — minimal viable forward pass
     "smoke": {
         "num_layers": 4,
