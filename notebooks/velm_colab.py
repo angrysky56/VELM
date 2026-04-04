@@ -64,14 +64,15 @@ def detect_hardware() -> dict:
             return {"batch": 256, "ae_steps": 100_000, "egg_steps": 10_000,
                     "pop": 64, "chunks": 500_000, "name": "A100/H100"}
         else:  # T4, L4, RTX 3060, etc.
-            return {"batch": 64, "ae_steps": 100_000, "egg_steps": 5_000,
+            return {"batch": 64, "ae_steps": 150_000, "egg_steps": 5_000,
                     "pop": 32, "chunks": 250_000, "name": "T4/consumer"}
     except Exception:  # pylint: disable=broad-except
         return {"batch": 32, "ae_steps": 10_000, "egg_steps": 1_000,
                 "pop": 16, "chunks": 50_000, "name": "CPU (slow!)"}
 
 HW = detect_hardware()
-CONFIG_NAME = "gpu_12gb"
+# gpu_12gb_v2: ae_hidden_dim=384 for 248K Qwen vocab (256 plateaus ~99.66%)
+CONFIG_NAME = "gpu_12gb_v2"
 cfg = CONFIGS[CONFIG_NAME]
 K = cfg["chunk_size_k"]
 print(f"Hardware: {HW['name']} | Config: {CONFIG_NAME}")
@@ -256,7 +257,8 @@ for step in range(1, AE_STEPS + 1):
                            "accuracy": acc}, f, indent=2)
             print(f"  >> Saved best checkpoint (acc={acc:.4%})")
         if acc > 0.999:
-            print(f"  🎯 TARGET >99.9% at step {step}!")
+            print(f"  🎯 TARGET >99.9% at step {step}! — stopping early")
+            break
 
 total_time = time.time() - start_time
 final_acc = history["accuracy"][-1] if history["accuracy"] else 0.0
