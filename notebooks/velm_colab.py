@@ -45,7 +45,7 @@ from src.model.autoencoder import CALMAutoencoder, batch_ae_loss, reconstruction
 from src.model.energy_head import EnergyHead, energy_score
 from src.model.miras_backbone import VELMBackbone
 from src.model.config import CONFIGS, DEFAULT_TOKENIZER
-from src.training.eggroll import eggroll_step, create_eggroll_optimizer
+from src.training.eggroll import perturb_pytree  # used in Phase 2 custom ES loop
 print("✓ VELM modules imported")
 
 # %% — 2. Hardware-adaptive config
@@ -85,34 +85,80 @@ tokenizer = AutoTokenizer.from_pretrained(DEFAULT_TOKENIZER, trust_remote_code=T
 VOCAB_SIZE = len(tokenizer)
 print(f"Tokenizer: {DEFAULT_TOKENIZER}, vocab: {VOCAB_SIZE:,}")
 
-# %% — 4. Stream OpenWebMath and tokenize into K=4 chunks
+# %% — 4. Stream and tokenize training data (multi-dataset curriculum)
 from datasets import load_dataset
 from tqdm import tqdm
 
 TARGET_CHUNKS = HW["chunks"]
 
-print(f"Streaming OpenWebMath → {TARGET_CHUNKS:,} chunks...")
-dataset = load_dataset("open-web-math/open-web-math", split="train", streaming=True)
+print(f"Loading training data → {TARGET_CHUNKS:,} chunks (K={K})...")
 
 chunk_buffer: list[np.ndarray] = []
+chunk_labels: list[str] = []  # domain label per chunk for GEA Phase 3
 total_chunks = 0
 
-for example in tqdm(dataset, desc="Tokenizing", unit="docs"):
-    text = example.get("text", "")
-    if not text or len(text) < 50:
-        continue
-    tokens = tokenizer.encode(text, max_length=512, truncation=True)
-    usable = len(tokens) - (len(tokens) % K)
-    if usable < K:
-        continue
-    chunks = np.array(tokens[:usable], dtype=np.int32).reshape(-1, K)
-    chunk_buffer.append(chunks)
-    total_chunks += chunks.shape[0]
-    if total_chunks >= TARGET_CHUNKS:
-        break
+# Dataset sources with curriculum weights
+CURRICULUM = [
+    {"name": "open-web-math/open-web-math", "weight": 0.5, "label": "math",
+     "split": "train", "text_field": "text"},
+    {"name": "wikitext", "config": "wikitext-103-raw-v1", "weight": 0.3,
+     "label": "general", "split": "train", "text_field": "text"},
+    {"name": "roneneldan/TinyStories", "weight": 0.2, "label": "narrative",
+     "split": "train", "text_field": "text"},
+]
+
+for source in CURRICULUM:
+    source_target = int(TARGET_CHUNKS * source["weight"])
+    source_count = 0
+    label = source["label"]
+    print(f"  Streaming {label}: {source['name']} "
+          f"(target: {source_target:,} chunks)...")
+    try:
+        load_kwargs = {"split": source["split"], "streaming": True}
+        if "config" in source:
+            load_kwargs["name"] = source["config"]
+        ds = load_dataset(source["name"], **load_kwargs)
+        text_field = source.get("text_field", "text")
+        for example in tqdm(ds, desc=f"  {label}", unit="docs", leave=False):
+            text = example.get(text_field, "")
+            if not text or len(text) < 50:
+                continue
+            tokens = tokenizer.encode(text, max_length=512, truncation=True)
+            usable = len(tokens) - (len(tokens) % K)
+            if usable < K:
+                continue
+            chunks = np.array(tokens[:usable], dtype=np.int32).reshape(-1, K)
+            chunk_buffer.append(chunks)
+            chunk_labels.extend([label] * chunks.shape[0])
+            source_count += chunks.shape[0]
+            total_chunks += chunks.shape[0]
+            if source_count >= source_target:
+                break
+        print(f"    ✓ {label}: {source_count:,} chunks")
+    except Exception as e:  # pylint: disable=broad-except
+        print(f"    ⚠ {label} failed ({e}), generating fallback random chunks")
+        fallback_n = source_target - source_count
+        if fallback_n > 0:
+            rng = np.random.default_rng(42)
+            fallback = rng.integers(0, VOCAB_SIZE, size=(fallback_n, K), dtype=np.int32)
+            chunk_buffer.append(fallback)
+            chunk_labels.extend([f"{label}_fallback"] * fallback_n)
+            total_chunks += fallback_n
+
+if total_chunks == 0:
+    raise RuntimeError("No training data loaded! Check network and dataset access.")
 
 all_chunks = np.concatenate(chunk_buffer, axis=0)[:TARGET_CHUNKS]
-print(f"✓ {all_chunks.shape[0]:,} chunks × K={K} = {all_chunks.shape[0]*K:,} tokens")
+chunk_labels = chunk_labels[:TARGET_CHUNKS]
+num_chunks = all_chunks.shape[0]
+
+# Report dataset composition
+label_counts: dict[str, int] = {}
+for lab in chunk_labels:
+    label_counts[lab] = label_counts.get(lab, 0) + 1
+print(f"\n✓ {num_chunks:,} chunks × K={K} = {num_chunks * K:,} tokens")
+for lab, cnt in sorted(label_counts.items()):
+    print(f"  {lab}: {cnt:,} ({cnt / num_chunks:.0%})")
 
 # %% — 5. Phase 1: Train CALM Autoencoder
 HIDDEN_DIM = cfg.get("ae_hidden_dim", 256)
@@ -271,25 +317,32 @@ trainable = {
     "head": eqx.filter(head, eqx.is_array),
 }
 
-# fitness function — uses _current_batch set per step
-_current_batch = None
+# Extract static (non-array) module parts ONCE — used by evaluate_member and GEA
+_bb_static = eqx.filter(backbone, lambda x: not eqx.is_array(x))
+_hd_static = eqx.filter(head, lambda x: not eqx.is_array(x))
 
-def fitness_fn(params):
-    """Evaluate fitness: negative energy loss on current batch."""
-    bb = eqx.combine(params["backbone"],
-                      eqx.filter(backbone, lambda x: not eqx.is_array(x)))
-    hd = eqx.combine(params["head"],
-                      eqx.filter(head, lambda x: not eqx.is_array(x)))
-    batch_tokens = _current_batch
+
+
+
+@eqx.filter_jit
+def evaluate_member(base_params, member_key, batch):
+    """Evaluate one perturbed population member.
+
+    JIT-compiled with batch as an explicit argument — no closures over
+    mutable state, so this compiles ONCE and reuses on every step.
+    """
+    perturbed, perturbation = perturb_pytree(base_params, member_key, SIGMA, rank=1)
+    bb = eqx.combine(perturbed["backbone"], _bb_static)
+    hd = eqx.combine(perturbed["head"], _hd_static)
 
     # encode chunks → target latents via frozen AE
-    tgt_z = jax.vmap(lambda c: frozen_ae.encode(c, training=False)[0])(batch_tokens)
+    tgt_z = jax.vmap(lambda c: frozen_ae.encode(c, training=False)[0])(batch)
 
     # compress input for backbone
     def compress(chunk):
         embs = jax.vmap(frozen_ae.embedding)(chunk)
         return bb.compress_input(embs)
-    inp_seq = jax.vmap(compress)(batch_tokens)
+    inp_seq = jax.vmap(compress)(batch)
 
     # backbone forward → hidden states
     hid, _ = bb(inp_seq)
@@ -301,34 +354,81 @@ def fitness_fn(params):
         return energy_score(samples, z_t)
     loss_vals = jax.vmap(pos_loss)(hid_in, z_target)
     fitness = -jnp.mean(loss_vals)
-    # guard against NaN/Inf from numerical instability in early training
-    return jnp.where(jnp.isfinite(fitness), fitness, -1e6)
+    return jnp.where(jnp.isfinite(fitness), fitness, -1e6), perturbation
 
-eggroll_opt, eggroll_state = create_eggroll_optimizer(trainable, learning_rate=EGG_LR)
+# optimizer for ES gradient updates
+eggroll_opt = optax.adam(EGG_LR)
+eggroll_opt_state = eggroll_opt.init(trainable)
+
+# --- Warmup: compile the evaluation function ONCE before the loop ---
+print("\nCompiling backbone evaluation (one-time, may take 2-5 min on T4)...")
+compile_start = time.time()
+_warmup_key = jax.random.PRNGKey(0)
+_warmup_batch = jnp.array(all_chunks[:EVAL_BATCH])
+_warmup_f, _warmup_p = evaluate_member(trainable, _warmup_key, _warmup_batch)
+_warmup_f.block_until_ready()  # force compilation to finish
+del _warmup_f, _warmup_p
+print(f"✓ Compilation done in {time.time() - compile_start:.0f}s — "
+      "training loop will be fast\n")
 
 # EGGROLL training loop
-print(f"\nPhase 2: EGGROLL training — {EGGROLL_STEPS:,} steps")
+print(f"Phase 2: EGGROLL training — {EGGROLL_STEPS:,} steps, pop={POP_SIZE}")
 print("=" * 60)
 
 egg_history = {"mean_fitness": [], "max_fitness": [], "grad_norm": []}
 start = time.time()
+best_egg_fitness = -float("inf")
 
 for step in range(1, EGGROLL_STEPS + 1):
     key, batch_key, step_key = jax.random.split(key, 3)
 
-    # fresh batch each step, shared across population for fair comparison
+    # fresh batch each step — passed as argument, NOT closed over
     idx = jax.random.randint(batch_key, (EVAL_BATCH,), 0, num_chunks)
-    _current_batch = jnp.array(all_chunks[idx])
+    batch = jnp.array(all_chunks[idx])
 
-    trainable, eggroll_state, metrics = eggroll_step(
-        trainable, fitness_fn, eggroll_opt, eggroll_state,
-        key=step_key, population_size=POP_SIZE, sigma=SIGMA, rank=1,
+    # evaluate population (Python loop — each call reuses the compiled function)
+    member_keys = jax.random.split(step_key, POP_SIZE)
+    fitnesses_list = []
+    perturbations_list = []
+    for member_key in member_keys:
+        fit, pert = evaluate_member(trainable, member_key, batch)
+        fitnesses_list.append(fit)
+        perturbations_list.append(pert)
+
+    fitnesses_arr = jnp.array(fitnesses_list)
+
+    # rank-based fitness normalization (more robust than raw fitness)
+    ranks = jnp.argsort(jnp.argsort(fitnesses_arr)).astype(jnp.float32)
+    normalized = 0.5 - ranks / (POP_SIZE - 1)
+
+    # ES gradient: weighted sum of perturbation directions
+    leaves_list = [jax.tree.leaves(p) for p in perturbations_list]
+    treedef = jax.tree.structure(perturbations_list[0])
+    es_grad_leaves = []
+    for j in range(len(leaves_list[0])):
+        stacked = jnp.stack([ll[j] for ll in leaves_list], axis=0)
+        w = normalized.reshape((-1,) + (1,) * (stacked.ndim - 1))
+        es_grad_leaves.append(jnp.sum(stacked * w, axis=0))
+
+    es_grad = jax.tree.unflatten(treedef, es_grad_leaves)
+
+    # scale by 1/(σ·N) and negate (optimizer minimizes, ES maximizes)
+    scale = -1.0 / (SIGMA * POP_SIZE)
+    neg_grad = jax.tree.map(lambda g: g * scale, es_grad)
+
+    # Adam update
+    updates, eggroll_opt_state = eggroll_opt.update(
+        neg_grad, eggroll_opt_state, trainable
     )
+    trainable = optax.apply_updates(trainable, updates)
 
+    # logging every 100 steps
     if step % 100 == 0:
-        mf = float(metrics["mean_fitness"])
-        xf = float(metrics["max_fitness"])
-        gn = float(metrics["grad_norm"])
+        mf = float(jnp.mean(fitnesses_arr))
+        xf = float(jnp.max(fitnesses_arr))
+        gn = float(jnp.sqrt(sum(
+            jnp.sum(leaf**2) for leaf in jax.tree.leaves(es_grad)
+        )))
         egg_history["mean_fitness"].append(mf)
         egg_history["max_fitness"].append(xf)
         egg_history["grad_norm"].append(gn)
@@ -337,19 +437,31 @@ for step in range(1, EGGROLL_STEPS + 1):
               f"mean_f: {mf:.4f} | max_f: {xf:.4f} | "
               f"grad: {gn:.4f} | {elapsed/60:.0f}m")
 
+    # checkpoint every 500 steps
+    if step % 500 == 0:
+        cur_fitness = float(jnp.mean(fitnesses_arr))
+        os.makedirs("checkpoints", exist_ok=True)
+        ckpt_bb = eqx.combine(trainable["backbone"], _bb_static)
+        ckpt_hd = eqx.combine(trainable["head"], _hd_static)
+        eqx.tree_serialise_leaves(f"checkpoints/backbone_step{step}.eqx", ckpt_bb)
+        eqx.tree_serialise_leaves(f"checkpoints/head_step{step}.eqx", ckpt_hd)
+        if cur_fitness > best_egg_fitness:
+            best_egg_fitness = cur_fitness
+            eqx.tree_serialise_leaves("checkpoints/backbone_eggroll_best.eqx", ckpt_bb)
+            eqx.tree_serialise_leaves("checkpoints/head_eggroll_best.eqx", ckpt_hd)
+            print(f"  >> New best fitness: {cur_fitness:.4f} — saved checkpoint")
+
 elapsed = time.time() - start
 print(f"\nPhase 2 done: {elapsed/3600:.2f}h")
 
-# save backbone + head
-final_bb = eqx.combine(trainable["backbone"],
-                         eqx.filter(backbone, lambda x: not eqx.is_array(x)))
-final_hd = eqx.combine(trainable["head"],
-                         eqx.filter(head, lambda x: not eqx.is_array(x)))
+# save final
+final_bb = eqx.combine(trainable["backbone"], _bb_static)
+final_hd = eqx.combine(trainable["head"], _hd_static)
 
 eqx.tree_serialise_leaves("checkpoints/backbone_eggroll.eqx", final_bb)
 eqx.tree_serialise_leaves("checkpoints/energy_head_eggroll.eqx", final_hd)
 
-import json
+import json  # noqa: E402
 with open("checkpoints/backbone_meta.json", "w", encoding="utf-8") as f:
     json.dump({"config": CONFIG_NAME, "vocab_size": VOCAB_SIZE,
                "tokenizer": DEFAULT_TOKENIZER,
@@ -413,8 +525,21 @@ print(f"\nPhase 3: GEA Group Evolution — {GEA_ITERATIONS} iterations")
 print(f"  population: {GEA_POP} | group: {GEA_GROUP} | σ: {GEA_SIGMA}")
 print("=" * 60)
 
-# Build a task distribution from loaded data domains
-# Create a simple fitness function that evaluates backbone + head on a task
+# Build task distribution from actual data domains (set in Section 4)
+unique_labels = sorted(set(
+    lab for lab in chunk_labels if not lab.endswith("_fallback")
+))
+task_distribution = (
+    [{"type": lab} for lab in unique_labels]
+    if unique_labels else [{"type": "default"}]
+)
+print(f"  Task domains: {[t['type'] for t in task_distribution]}")
+
+# Build per-domain index lookup for efficient sampling
+domain_indices: dict[str, list[int]] = {}
+for i, lab in enumerate(chunk_labels):
+    domain_indices.setdefault(lab, []).append(i)
+
 def gea_fitness_fn(params, task):
     """Evaluate fitness on a specific task domain.
 
@@ -422,29 +547,20 @@ def gea_fitness_fn(params, task):
     """
     task_type = task.get("type", "default")
 
-    # assemble full models from params
-    bb = eqx.combine(params["backbone"],
-                      eqx.filter(backbone, lambda x: not eqx.is_array(x)))
-    hd = eqx.combine(params["head"],
-                      eqx.filter(head, lambda x: not eqx.is_array(x)))
+    # assemble full models from params (using pre-extracted static parts)
+    bb = eqx.combine(params["backbone"], _bb_static)
+    hd = eqx.combine(params["head"], _hd_static)
 
-    # sample a small batch from the specific domain
+    # sample from the specific domain using chunk_labels index
     domain_key = jax.random.PRNGKey(hash(task_type) % (2**31))
-    # select chunks by domain label if available
-    domain_idx = [
-        i for i, lab in enumerate(
-            getattr(data_loader, "chunk_labels", [])
-        ) if lab == task_type
-    ] if hasattr(data_loader, "chunk_labels") else []
+    domain_idx = domain_indices.get(task_type, [])
 
     if domain_idx:
         sample_idx = np.array(domain_idx[:EVAL_BATCH], dtype=np.int32)
         if len(sample_idx) < EVAL_BATCH:
-            # pad with random repeats from domain
             extra = np.random.choice(domain_idx, EVAL_BATCH - len(sample_idx))
             sample_idx = np.concatenate([sample_idx, extra.astype(np.int32)])
     else:
-        # fallback to random chunks
         sample_idx = jax.random.randint(domain_key, (EVAL_BATCH,), 0, num_chunks)
 
     batch_tokens = jnp.array(all_chunks[np.array(sample_idx)])
@@ -476,38 +592,15 @@ def gea_fitness_fn(params, task):
     return float(fitness), metrics
 
 
-# Task distribution: one per data domain
-# Use simple domain labels from the loaded data
-task_distribution = [
-    {"type": "math"},
-    {"type": "general"},
-    {"type": "narrative"},
-]
-
-# Try to build from actual data loader if available
-try:
-    data_loader  # noqa: F821
-    task_distribution = data_loader.get_task_distribution()
-    if not task_distribution:
-        task_distribution = [{"type": "default"}]
-except NameError:
-    # data_loader not defined — use default tasks
-    task_distribution = [{"type": "default"}]
-
-# Initialize GEA optimizer (separate from EGGROLL Phase 2)
+# GEA optimizer (separate from EGGROLL Phase 2)
 gea_optimizer = optax.chain(
     optax.clip_by_global_norm(1.0),
     optax.adam(1e-3),
 )
-gea_opt_state = gea_optimizer.init(eqx.filter(backbone, eqx.is_array))
-# We need opt_state matching the trainable pytree shape
 gea_opt_state = gea_optimizer.init(trainable)
 
 # Initialize GroupEvolver
-evolver = GroupEvolver(
-    population_size=GEA_POP,
-    group_size=GEA_GROUP,
-)
+evolver = GroupEvolver(population_size=GEA_POP, group_size=GEA_GROUP)
 
 # GEA evolution loop
 gea_history = {"mean_fitness": [], "max_fitness": [], "parent_sizes": []}
@@ -518,12 +611,8 @@ for gea_iter in range(1, GEA_ITERATIONS + 1):
 
     # GEA evaluate + select
     experience, traces = evolver.evolution_step(
-        trainable,
-        gea_fitness_fn,
-        task_distribution,
-        key=iter_key,
-        sigma=GEA_SIGMA,
-        rank=1,
+        trainable, gea_fitness_fn, task_distribution,
+        key=iter_key, sigma=GEA_SIGMA, rank=1,
     )
 
     # extract unique parent indices
@@ -537,13 +626,9 @@ for gea_iter in range(1, GEA_ITERATIONS + 1):
 
     # experience-biased EGGROLL update
     trainable, gea_opt_state, step_metrics = experience_weighted_eggroll_step(
-        trainable,
-        traces,
-        key=eggroll_key,
-        optimizer=gea_optimizer,
-        opt_state=gea_opt_state,
-        sigma=GEA_SIGMA,
-        rank=1,
+        trainable, traces, key=eggroll_key,
+        optimizer=gea_optimizer, opt_state=gea_opt_state,
+        sigma=GEA_SIGMA, rank=1,
         parent_indices=unique_parents if unique_parents else None,
         parent_bias=GEA_BIAS,
     )
@@ -563,10 +648,8 @@ gea_elapsed = time.time() - gea_start
 print(f"\nPhase 3 done: {gea_elapsed/60:.1f}m")
 
 # save evolved params
-final_bb = eqx.combine(trainable["backbone"],
-                         eqx.filter(backbone, lambda x: not eqx.is_array(x)))
-final_hd = eqx.combine(trainable["head"],
-                         eqx.filter(head, lambda x: not eqx.is_array(x)))
+final_bb = eqx.combine(trainable["backbone"], _bb_static)
+final_hd = eqx.combine(trainable["head"], _hd_static)
 
 eqx.tree_serialise_leaves("checkpoints/backbone_gea.eqx", final_bb)
 eqx.tree_serialise_leaves("checkpoints/energy_head_gea.eqx", final_hd)
@@ -638,7 +721,7 @@ print("✅ VELM Training Complete!")
 print("=" * 60)
 print(f"Config:      {CONFIG_NAME}")
 print(f"Tokenizer:   {DEFAULT_TOKENIZER} (vocab={VOCAB_SIZE:,})")
-print(f"Dataset:     OpenWebMath ({all_chunks.shape[0]:,} chunks)")
+print(f"Dataset:     {num_chunks:,} chunks across {len(set(chunk_labels)):,} domains")
 print(f"AE accuracy: {final_acc:.4%}")
 print(f"GEA iters:   {GEA_ITERATIONS} (bias={GEA_BIAS})")
 print("\nCheckpoints saved:")
