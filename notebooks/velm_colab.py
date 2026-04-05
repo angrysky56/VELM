@@ -405,9 +405,12 @@ else:
 # %% — 7. Phase 2: EGGROLL Backbone Training (gradient-free)
 POP_SIZE = HW["pop"]
 EGGROLL_STEPS = HW["egg_steps"]
-SIGMA = cfg.get("eggroll_sigma", 0.001)  # was 0.01 — 10x too large, caused weight explosion
-EGG_LR = cfg.get("eggroll_lr", 3e-4)    # was 1e-3 — too aggressive for noisy ES gradients
-EVAL_BATCH = 32
+SIGMA = cfg.get("eggroll_sigma", 0.001)
+EGG_LR = cfg.get("eggroll_lr", 3e-4)
+EVAL_BATCH = cfg.get("eggroll_eval_batch", 128)  # was 32 — more data per eval
+ANTITHETIC = cfg.get("eggroll_antithetic", True)  # ±σ pairs: halves variance
+HC_D = cfg.get("hc_streams", 1)  # go-mHC residual streams
+HC_S = cfg.get("hc_s", 2)        # go-mHC expressivity
 
 key = jax.random.PRNGKey(123)
 k1, k2, key = jax.random.split(key, 3)
@@ -416,7 +419,10 @@ backbone = VELMBackbone(
     dim=cfg["hidden_dim"], num_heads=cfg["num_heads"],
     num_miras_layers=cfg["miras_layers"], num_swa_layers=cfg["swa_layers"],
     ffn_intermediate=cfg["ffn_intermediate"], chunk_size=K,
-    ae_hidden_dim=HIDDEN_DIM, key=k1,
+    ae_hidden_dim=HIDDEN_DIM,
+    hc_streams=HC_D,  # go-mHC d-axis scaling
+    hc_s=HC_S,
+    key=k1,
 )
 
 head = EnergyHead(
@@ -427,7 +433,10 @@ head = EnergyHead(
 bb_p = sum(x.size for x in jax.tree.leaves(eqx.filter(backbone, eqx.is_array)))
 hd_p = sum(x.size for x in jax.tree.leaves(eqx.filter(head, eqx.is_array)))
 print(f"Backbone: {bb_p:,} | Head: {hd_p:,} | Total: {bb_p+hd_p:,}")
-print(f"EGGROLL: pop={POP_SIZE}, σ={SIGMA}, steps={EGGROLL_STEPS:,}")
+if HC_D > 1:
+    print(f"go-mHC: d={HC_D} streams, s={HC_S} (doubly stochastic routing)")
+print(f"EGGROLL: pop={POP_SIZE}, σ={SIGMA}, steps={EGGROLL_STEPS:,}"
+      f"{', antithetic' if ANTITHETIC else ''}, eval_batch={EVAL_BATCH}")
 
 frozen_ae = model  # from Phase 1
 
@@ -440,6 +449,119 @@ trainable = {
 # Extract static (non-array) module parts ONCE — used by evaluate_member and GEA
 _bb_static = eqx.filter(backbone, lambda x: not eqx.is_array(x))
 _hd_static = eqx.filter(head, lambda x: not eqx.is_array(x))
+
+# %% — 7a. Phase 2a: Gradient-based backbone training
+# The current forward pass is fully differentiable through JAX.
+# Gradient-based training converges orders of magnitude faster than
+# ES with pop=32 on 7M params (SNR ≈ 0.012).
+# EGGROLL is preserved below as Phase 2b for future nonlinear recurrence.
+
+USE_GRADIENT_PHASE = False  # optional warmup only — EGGROLL is primary
+GRAD_STEPS = 20_000
+GRAD_LR = 3e-4
+GRAD_BATCH = EVAL_BATCH  # 32 chunks per step
+
+if USE_GRADIENT_PHASE:
+    print(f"\nPhase 2a: Gradient-based backbone + head training")
+    print(f"  {GRAD_STEPS:,} steps, batch={GRAD_BATCH}, lr={GRAD_LR}")
+    print("=" * 60)
+
+    grad_schedule = optax.warmup_cosine_decay_schedule(
+        init_value=0.0, peak_value=GRAD_LR,
+        warmup_steps=500, decay_steps=GRAD_STEPS, end_value=GRAD_LR * 0.01,
+    )
+    grad_optimizer = optax.chain(
+        optax.clip_by_global_norm(1.0),
+        optax.adamw(grad_schedule, weight_decay=0.01),
+    )
+    grad_opt_state = grad_optimizer.init(trainable)
+
+    @eqx.filter_jit
+    def grad_train_step(params, opt_st, batch_tokens, step_key):
+        """Gradient-based backbone + energy head training step."""
+        def loss_fn(p):
+            bb = eqx.combine(p["backbone"], _bb_static)
+            hd = eqx.combine(p["head"], _hd_static)
+            # encode chunks → target latents via frozen AE
+            tgt_z = jax.vmap(
+                lambda c: frozen_ae.encode(c, training=False)[0])(batch_tokens)
+            # compress input for backbone
+            def compress(chunk):
+                embs = jax.vmap(frozen_ae.embedding)(chunk)
+                return bb.compress_input(embs)
+            inp_seq = jax.vmap(compress)(batch_tokens)
+            # backbone forward
+            hid, _ = bb(inp_seq)
+            # energy loss: predict z_{i+1} from h_i
+            hid_in, z_target = hid[:-1], tgt_z[1:]
+            def pos_loss(h, z_t, k):
+                samples = hd(h, key=k, num_samples=8)
+                return energy_score(samples, z_t)
+            keys = jax.random.split(step_key, hid_in.shape[0])
+            losses = jax.vmap(pos_loss)(hid_in, z_target, keys)
+            return jnp.mean(losses)
+
+        loss_val, grads = eqx.filter_value_and_grad(loss_fn)(params)
+        updates, new_opt = grad_optimizer.update(grads, opt_st, params)
+        new_params = optax.apply_updates(params, updates)
+        return new_params, new_opt, loss_val
+
+    # compile warmup
+    print("Compiling gradient training step (one-time)...")
+    _w_batch = jnp.array(all_chunks[:GRAD_BATCH])
+    _w_key = jax.random.PRNGKey(0)
+    _, _, _w_loss = grad_train_step(trainable, grad_opt_state, _w_batch, _w_key)
+    _w_loss.block_until_ready()
+    print(f"✓ Compiled | initial energy loss: {float(_w_loss):.4f}\n")
+
+    grad_history = {"energy_loss": []}
+    grad_start = time.time()
+    best_grad_loss = float("inf")
+
+    for step in range(1, GRAD_STEPS + 1):
+        key, batch_key, step_key = jax.random.split(key, 3)
+        idx = jax.random.randint(batch_key, (GRAD_BATCH,), 0, num_chunks)
+        batch = jnp.array(all_chunks[idx])
+        trainable, grad_opt_state, eloss = grad_train_step(
+            trainable, grad_opt_state, batch, step_key)
+
+        if step % 200 == 0:
+            el = float(eloss)
+            grad_history["energy_loss"].append(el)
+            elapsed = time.time() - grad_start
+            marker = ""
+            if el < best_grad_loss:
+                best_grad_loss = el
+                marker = " ★"
+            print(f"  step {step:>5}/{GRAD_STEPS} | energy: {el:.4f}{marker} | "
+                  f"{step/elapsed:.1f} steps/s | {elapsed/60:.0f}m")
+
+        if step % 2000 == 0:
+            os.makedirs("checkpoints", exist_ok=True)
+            ckpt_bb = eqx.combine(trainable["backbone"], _bb_static)
+            ckpt_hd = eqx.combine(trainable["head"], _hd_static)
+            eqx.tree_serialise_leaves(
+                "checkpoints/backbone_grad.eqx", ckpt_bb)
+            eqx.tree_serialise_leaves(
+                "checkpoints/energy_head_grad.eqx", ckpt_hd)
+            print(f"  >> Checkpoint saved (energy={best_grad_loss:.4f})")
+
+    grad_elapsed = time.time() - grad_start
+    print(f"\nPhase 2a done: {grad_elapsed/3600:.2f}h | "
+          f"best energy loss: {best_grad_loss:.4f}")
+
+    # save final gradient-trained models
+    final_bb = eqx.combine(trainable["backbone"], _bb_static)
+    final_hd = eqx.combine(trainable["head"], _hd_static)
+    eqx.tree_serialise_leaves("checkpoints/backbone_grad.eqx", final_bb)
+    eqx.tree_serialise_leaves("checkpoints/energy_head_grad.eqx", final_hd)
+    print("✓ Saved: checkpoints/backbone_grad.eqx + energy_head_grad.eqx")
+
+# %% — 7b. Phase 2b: EGGROLL fine-tuning (gradient-free, optional)
+# Skip this if gradient-based Phase 2a already trained the backbone.
+# EGGROLL is preserved for future nonlinear recurrence where backprop is
+# impractical (true BPTT over long sequences with nonlinear Miras memory).
+USE_EGGROLL_PHASE = True  # EGGROLL is the primary training method
 
 
 
@@ -476,7 +598,32 @@ def evaluate_member(base_params, member_key, batch):
     fitness = -jnp.mean(loss_vals)
     return jnp.where(jnp.isfinite(fitness), fitness, -1e6), perturbation
 
+
+@eqx.filter_jit
+def evaluate_params(params, batch):
+    """Evaluate fitness for pre-built params (no perturbation).
+
+    Used by antithetic sampling where we manually construct ±σ params.
+    """
+    bb = eqx.combine(params["backbone"], _bb_static)
+    hd = eqx.combine(params["head"], _hd_static)
+    tgt_z = jax.vmap(lambda c: frozen_ae.encode(c, training=False)[0])(batch)
+    def compress(chunk):
+        embs = jax.vmap(frozen_ae.embedding)(chunk)
+        return bb.compress_input(embs)
+    inp_seq = jax.vmap(compress)(batch)
+    hid, _ = bb(inp_seq)
+    hid_in, z_target = hid[:-1], tgt_z[1:]
+    def pos_loss(h, z_t):
+        samples = hd(h, key=jax.random.PRNGKey(0), num_samples=8)
+        return energy_score(samples, z_t)
+    loss_vals = jax.vmap(pos_loss)(hid_in, z_target)
+    fitness = -jnp.mean(loss_vals)
+    return jnp.where(jnp.isfinite(fitness), fitness, -1e6)
+
+
 # optimizer for ES gradient updates — clip to prevent weight explosion
+# (only used when USE_EGGROLL_PHASE=True)
 eggroll_opt = optax.chain(
     optax.clip_by_global_norm(1.0),  # prevents the exponential divergence seen in v1
     optax.adam(EGG_LR),
@@ -490,53 +637,86 @@ _warmup_key = jax.random.PRNGKey(0)
 _warmup_batch = jnp.array(all_chunks[:EVAL_BATCH])
 _warmup_f, _warmup_p = evaluate_member(trainable, _warmup_key, _warmup_batch)
 _warmup_f.block_until_ready()  # force compilation to finish
-del _warmup_f, _warmup_p
+# also compile the antithetic evaluation function
+_warmup_f2 = evaluate_params(trainable, _warmup_batch)
+_warmup_f2.block_until_ready()
+del _warmup_f, _warmup_p, _warmup_f2
 print(f"✓ Compilation done in {time.time() - compile_start:.0f}s — "
       "training loop will be fast\n")
 
 # EGGROLL training loop
-print(f"Phase 2: EGGROLL training — {EGGROLL_STEPS:,} steps, pop={POP_SIZE}")
-print("=" * 60)
+if not USE_EGGROLL_PHASE:
+    print(f"\n⏭ Skipping EGGROLL loop (USE_EGGROLL_PHASE=False)")
+    print(f"  Backbone was trained via gradient descent in Phase 2a")
+    egg_history = {"mean_fitness": [], "max_fitness": [], "grad_norm": []}
+else:
+    print(f"Phase 2b: EGGROLL training — {EGGROLL_STEPS:,} steps, pop={POP_SIZE}")
+    print("=" * 60)
 
-egg_history = {"mean_fitness": [], "max_fitness": [], "grad_norm": []}
+egg_history = egg_history if not USE_EGGROLL_PHASE else {
+    "mean_fitness": [], "max_fitness": [], "grad_norm": []}
 start = time.time()
 best_egg_fitness = -float("inf")
 
-for step in range(1, EGGROLL_STEPS + 1):
+for step in range(1, (EGGROLL_STEPS + 1) if USE_EGGROLL_PHASE else 0):
     key, batch_key, step_key = jax.random.split(key, 3)
 
     # fresh batch each step — passed as argument, NOT closed over
     idx = jax.random.randint(batch_key, (EVAL_BATCH,), 0, num_chunks)
     batch = jnp.array(all_chunks[idx])
 
-    # evaluate population (Python loop — each call reuses the compiled function)
+    # evaluate population with antithetic sampling (±σ pairs)
     member_keys = jax.random.split(step_key, POP_SIZE)
     fitnesses_list = []
     perturbations_list = []
+    fitness_diffs = []  # for antithetic: f(+σ) - f(-σ)
+
     for member_key in member_keys:
-        fit, pert = evaluate_member(trainable, member_key, batch)
-        fitnesses_list.append(fit)
+        _, pert = perturb_pytree(trainable, member_key, SIGMA, rank=1)
+
+        if ANTITHETIC:
+            # evaluate BOTH +σ and -σ directions (halves gradient variance)
+            pos_params = jax.tree.map(
+                lambda p, e: p + SIGMA * e, trainable, pert)
+            neg_params = jax.tree.map(
+                lambda p, e: p - SIGMA * e, trainable, pert)
+            f_pos = evaluate_params(pos_params, batch)
+            f_neg = evaluate_params(neg_params, batch)
+            fitnesses_list.append((f_pos + f_neg) / 2)  # for logging
+            fitness_diffs.append(f_pos - f_neg)
+        else:
+            fit, _ = evaluate_member(trainable, member_key, batch)
+            fitnesses_list.append(fit)
+
         perturbations_list.append(pert)
 
     fitnesses_arr = jnp.array(fitnesses_list)
 
-    # rank-based fitness normalization (more robust than raw fitness)
-    ranks = jnp.argsort(jnp.argsort(fitnesses_arr)).astype(jnp.float32)
-    normalized = 0.5 - ranks / (POP_SIZE - 1)
-
-    # ES gradient: weighted sum of perturbation directions
+    # ES gradient computation
     leaves_list = [jax.tree.leaves(p) for p in perturbations_list]
     treedef = jax.tree.structure(perturbations_list[0])
     es_grad_leaves = []
-    for j in range(len(leaves_list[0])):
-        stacked = jnp.stack([ll[j] for ll in leaves_list], axis=0)
-        w = normalized.reshape((-1,) + (1,) * (stacked.ndim - 1))
-        es_grad_leaves.append(jnp.sum(stacked * w, axis=0))
 
-    es_grad = jax.tree.unflatten(treedef, es_grad_leaves)
+    if ANTITHETIC:
+        # antithetic gradient: (1/2σN) Σ (f+ - f-) * E
+        diffs_arr = jnp.array(fitness_diffs)
+        for j in range(len(leaves_list[0])):
+            stacked = jnp.stack([ll[j] for ll in leaves_list], axis=0)
+            w = diffs_arr.reshape((-1,) + (1,) * (stacked.ndim - 1))
+            es_grad_leaves.append(jnp.sum(stacked * w, axis=0))
+        es_grad = jax.tree.unflatten(treedef, es_grad_leaves)
+        scale = -1.0 / (2.0 * SIGMA * POP_SIZE)
+    else:
+        # rank-based gradient (original, less efficient for small pop)
+        ranks = jnp.argsort(jnp.argsort(fitnesses_arr)).astype(jnp.float32)
+        normalized = 0.5 - ranks / (POP_SIZE - 1)
+        for j in range(len(leaves_list[0])):
+            stacked = jnp.stack([ll[j] for ll in leaves_list], axis=0)
+            w = normalized.reshape((-1,) + (1,) * (stacked.ndim - 1))
+            es_grad_leaves.append(jnp.sum(stacked * w, axis=0))
+        es_grad = jax.tree.unflatten(treedef, es_grad_leaves)
+        scale = -1.0 / (SIGMA * POP_SIZE)
 
-    # scale by 1/(σ·N) and negate (optimizer minimizes, ES maximizes)
-    scale = -1.0 / (SIGMA * POP_SIZE)
     neg_grad = jax.tree.map(lambda g: g * scale, es_grad)
 
     # Adam update

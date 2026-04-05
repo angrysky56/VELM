@@ -56,6 +56,10 @@ CONFIGS: dict[str, dict] = {
         "ae_kl_weight": 0.001,
         "eggroll_sigma": 0.001,
         "eggroll_lr": 3e-4,
+        "eggroll_antithetic": True,   # ±σ pairs: halves variance for small pop
+        "eggroll_eval_batch": 128,    # more data per eval → stabler fitness
+        "hc_streams": 4,             # d: number of residual streams (go-mHC)
+        "hc_s": 2,                   # s: orthostochastic expressivity param
     },
     # Smoke test / CI — minimal viable forward pass
     "smoke": {

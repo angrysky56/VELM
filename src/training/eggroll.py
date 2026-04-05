@@ -156,11 +156,17 @@ def eggroll_step(
     population_size: int = 64,
     sigma: float = 0.001,
     rank: int = 1,
+    antithetic: bool = True,
 ) -> tuple[PyTree, EGGROLLState, dict]:
-    """Single EGGROLL update step.
+    """Single EGGROLL update step with antithetic sampling.
 
     Evaluates a population of perturbed models, computes the ES
     gradient estimate, and applies an Adam update to base params.
+
+    When antithetic=True (default), each perturbation direction E_i
+    is evaluated at BOTH W+σE_i and W-σE_i. This doubles effective
+    population size at minimal compute cost, halving gradient variance.
+    Critical for small populations (pop=32 on 7M params).
 
     Args:
         base_params: current mean parameters M
@@ -168,9 +174,10 @@ def eggroll_step(
         optimizer: optax optimizer for ES gradient
         state: current EGGROLL state
         key: PRNG key
-        population_size: N workers
+        population_size: N directions (actual evals = 2N if antithetic)
         sigma: perturbation scale σ
         rank: perturbation rank r
+        antithetic: use ±σ pairs (halves variance, recommended)
 
     Returns:
         (updated_params, new_state, metrics_dict)
@@ -188,30 +195,50 @@ def eggroll_step(
         fitness = fitness_fn(perturbed)
         return fitness, perturbation
 
-    # jax.lax.map: sequential but JIT-compiled (vmap needs vmappable fn)
-    fitnesses_arr, perturbations_stacked = jax.lax.map(eval_member, keys)
-    # fitnesses_arr: (N,) scalar fitnesses
-    # perturbations_stacked: pytree with leading dim N per leaf
+    if antithetic:
+        # Antithetic sampling: evaluate both W+σE and W-σE per direction.
+        # This halves gradient variance — critical for small populations.
+        def eval_antithetic(member_key: jax.Array):
+            """Evaluate ±σ pair, return fitness difference and perturbation."""
+            _, perturbation = perturb_pytree(base_params, member_key, sigma, rank)
+            # positive direction: W + σE
+            pos_params = jax.tree.map(
+                lambda p, e: p + sigma * e, base_params, perturbation)
+            f_pos = fitness_fn(pos_params)
+            # negative direction: W - σE
+            neg_params = jax.tree.map(
+                lambda p, e: p - sigma * e, base_params, perturbation)
+            f_neg = fitness_fn(neg_params)
+            return f_pos, f_neg, perturbation
 
-    # ── Fitness normalization: rank-based ──────────────────────────────
-    # map fitnesses to [-0.5, 0.5] based on rank (more robust than raw)
-    ranks = jnp.argsort(jnp.argsort(fitnesses_arr)).astype(jnp.float32)
-    normalized = 0.5 - ranks / (population_size - 1)  # best=0.5, worst=-0.5
+        f_pos_arr, f_neg_arr, perturbations_stacked = jax.lax.map(
+            eval_antithetic, keys)
 
-    # ── ES gradient: weighted sum of perturbations ────────────────────
-    # perturbations_stacked has shape (N, ...) per leaf — use einsum-style
-    def weighted_leaf_sum(leaf_stack: jax.Array) -> jax.Array:
-        """Sum leaf_stack[i] * weight[i] over population dimension."""
-        # leaf_stack: (N, *shape), normalized: (N,)
-        # broadcast weights to match leaf dims
-        w = normalized.reshape((-1,) + (1,) * (leaf_stack.ndim - 1))
-        return jnp.sum(leaf_stack * w, axis=0)
+        # antithetic ES gradient: (1/2σN) Σ (f+ - f-) * E
+        diffs = f_pos_arr - f_neg_arr  # (N,)
+        fitnesses_arr = (f_pos_arr + f_neg_arr) / 2  # for metrics
 
-    es_grad = jax.tree.map(weighted_leaf_sum, perturbations_stacked)
+        def weighted_leaf_sum_anti(leaf_stack: jax.Array) -> jax.Array:
+            w = diffs.reshape((-1,) + (1,) * (leaf_stack.ndim - 1))
+            return jnp.sum(leaf_stack * w, axis=0)
 
-    # scale by 1/(σN)
-    scale = 1.0 / (sigma * population_size)
-    es_grad = jax.tree.map(lambda g: g * scale, es_grad)
+        es_grad = jax.tree.map(weighted_leaf_sum_anti, perturbations_stacked)
+        scale = 1.0 / (2.0 * sigma * population_size)
+        es_grad = jax.tree.map(lambda g: g * scale, es_grad)
+    else:
+        # Original rank-based ES gradient (less efficient for small pop)
+        fitnesses_arr, perturbations_stacked = jax.lax.map(eval_member, keys)
+
+        ranks = jnp.argsort(jnp.argsort(fitnesses_arr)).astype(jnp.float32)
+        normalized = 0.5 - ranks / (population_size - 1)
+
+        def weighted_leaf_sum(leaf_stack: jax.Array) -> jax.Array:
+            w = normalized.reshape((-1,) + (1,) * (leaf_stack.ndim - 1))
+            return jnp.sum(leaf_stack * w, axis=0)
+
+        es_grad = jax.tree.map(weighted_leaf_sum, perturbations_stacked)
+        scale = 1.0 / (sigma * population_size)
+        es_grad = jax.tree.map(lambda g: g * scale, es_grad)
 
     # negate gradient (ES maximizes fitness, optimizer minimizes)
     neg_grad = jax.tree.map(lambda g: -g, es_grad)

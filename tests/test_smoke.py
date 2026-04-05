@@ -146,6 +146,56 @@ def test_backbone():
     print("  backbone: OK")
 
 
+def test_go_mhc_projection():
+    """go-mHC: Cayley transform → doubly stochastic matrix."""
+    from src.model.hyper_connections import GoMHCProjection
+
+    d, s = 4, 2
+    proj = GoMHCProjection(d=d, s=s)
+    n_params = proj.num_params
+    params = jnp.zeros(n_params)  # zero → identity-like
+
+    B = proj(params)
+    assert B.shape == (d, d), f"Expected ({d},{d}), got {B.shape}"
+
+    # doubly stochastic: rows and columns sum to 1
+    row_sums = jnp.sum(B, axis=1)
+    col_sums = jnp.sum(B, axis=0)
+    assert jnp.allclose(row_sums, 1.0, atol=1e-5), f"Row sums: {row_sums}"
+    assert jnp.allclose(col_sums, 1.0, atol=1e-5), f"Col sums: {col_sums}"
+
+    # all entries non-negative
+    assert jnp.all(B >= -1e-7), f"Negative entries in B: {B}"
+
+    # test with random params — should still be doubly stochastic
+    key = jax.random.PRNGKey(42)
+    rand_params = jax.random.normal(key, (n_params,))
+    B2 = proj(rand_params)
+    assert jnp.allclose(jnp.sum(B2, axis=1), 1.0, atol=1e-5)
+    assert jnp.allclose(jnp.sum(B2, axis=0), 1.0, atol=1e-5)
+    print("  go-mHC projection: OK")
+
+
+def test_backbone_with_hc():
+    """Backbone with go-mHC d=2 hyper-connections."""
+    from src.model.miras_backbone import VELMBackbone
+
+    key = jax.random.PRNGKey(10)
+    backbone = VELMBackbone(
+        dim=DIM, num_heads=HEADS, num_miras_layers=2,
+        num_swa_layers=2, ffn_intermediate=FFN,
+        chunk_size=K, window_size=4,
+        hc_streams=2, hc_s=1,  # d=2 streams, minimal expressivity
+        key=key,
+    )
+
+    x = jax.random.normal(key, (SEQ, DIM))
+    out, states = backbone(x)
+    assert out.shape == (SEQ, DIM), f"Expected ({SEQ},{DIM}), got {out.shape}"
+    assert len(states) == 2
+    print("  backbone with HC: OK")
+
+
 def test_eggroll_perturbation():
     """EGGROLL low-rank perturbation generation."""
     from src.training.eggroll import (
@@ -193,6 +243,7 @@ def test_eggroll_step():
     new_params, new_state, metrics = eggroll_step(
         params, dummy_fitness, optimizer, state,
         key=key, population_size=8, sigma=0.01, rank=1,
+        antithetic=True,  # test antithetic sampling
     )
 
     assert new_params["w"].shape == (DIM, DIM)
@@ -316,6 +367,8 @@ def run_all():
         ("Miras memory layer", test_miras_layer),
         ("Sliding window attention", test_swa_layer),
         ("VELM backbone", test_backbone),
+        ("go-mHC projection", test_go_mhc_projection),
+        ("Backbone with HC", test_backbone_with_hc),
         ("EGGROLL perturbation", test_eggroll_perturbation),
         ("EGGROLL step", test_eggroll_step),
         ("CIB budget controller", test_cib_budget),

@@ -20,6 +20,12 @@ import jax
 import jax.numpy as jnp
 from jaxtyping import Array, Float
 
+from src.model.hyper_connections import (
+    HyperConnectionBlock,
+    collapse_streams,
+    init_streams,
+)
+
 
 class RMSNorm(eqx.Module):
     """Root Mean Square Layer Normalization."""
@@ -470,9 +476,11 @@ class VELMBackbone(eqx.Module):
     input_ffn: SwiGLUFFN
     miras_blocks: list[MirasBlock]
     swa_blocks: list[SWABlock]
+    hc_blocks: list[HyperConnectionBlock]  # go-mHC per layer
     final_norm: RMSNorm
     block_order: list[str]  # ["miras", "swa", "miras", "swa", ...]
     dim: int
+    hc_streams: int  # d: number of residual streams (1 = no HC)
 
     def __init__(
         self,
@@ -484,6 +492,8 @@ class VELMBackbone(eqx.Module):
         chunk_size: int = 4,
         window_size: int = 512,
         ae_hidden_dim: int | None = None,
+        hc_streams: int = 1,
+        hc_s: int = 2,
         *,
         key: jax.Array,
     ) -> None:
@@ -498,9 +508,12 @@ class VELMBackbone(eqx.Module):
             chunk_size: K tokens per autoregressive step
             window_size: SWA window size
             ae_hidden_dim: autoencoder embedding dimension (defaults to dim)
+            hc_streams: d — number of residual streams (1=standard, >1=go-mHC)
+            hc_s: s — go-mHC expressivity parameter
             key: PRNG key
         """
         self.dim = dim
+        self.hc_streams = hc_streams
         ae_dim = ae_hidden_dim if ae_hidden_dim is not None else dim
         total_layers = num_miras_layers + num_swa_layers
         keys = jax.random.split(key, total_layers + 2)
@@ -557,6 +570,18 @@ class VELMBackbone(eqx.Module):
         self.swa_blocks = s_blocks
         self.final_norm = RMSNorm(dim)
 
+        # go-mHC hyper-connection blocks (one per layer)
+        # when hc_streams=1, these are no-ops (standard residual)
+        if hc_streams > 1:
+            hc_keys = jax.random.split(
+                jax.random.PRNGKey(999), total_layers)
+            self.hc_blocks = [
+                HyperConnectionBlock(d=hc_streams, s=hc_s, key=hc_keys[i])
+                for i in range(total_layers)
+            ]
+        else:
+            self.hc_blocks = []
+
     def compress_input(
         self,
         chunk_embeddings: Float[Array, "K dim"],
@@ -588,19 +613,50 @@ class VELMBackbone(eqx.Module):
         if miras_states is None:
             miras_states = [None] * num_miras
 
+        d = self.hc_streams
+        use_hc = d > 1 and len(self.hc_blocks) > 0
+
+        # initialize d residual streams if using hyper-connections
+        if use_hc:
+            x_streams = init_streams(x, d)  # (d, T, dim)
+
         new_states = []
         m_idx, s_idx = 0, 0
 
-        for block_type in self.block_order:
-            if block_type == "miras":
-                x, state = self.miras_blocks[m_idx](x, miras_states[m_idx])
-                new_states.append(state)
-                m_idx += 1
-            else:
-                x = self.swa_blocks[s_idx](x)
-                s_idx += 1
+        for layer_idx, block_type in enumerate(self.block_order):
+            if use_hc:
+                hc = self.hc_blocks[layer_idx]
+                # H_res mixing across d streams
+                x_mixed = hc.mix_residual(x_streams)
+                # H_pre: aggregate streams → single input for the block
+                block_input = hc.aggregate_for_block(x_streams)
 
-        # final normalization
+                # run the actual block on aggregated input
+                if block_type == "miras":
+                    block_out, state = self.miras_blocks[m_idx](
+                        block_input, miras_states[m_idx])
+                    new_states.append(state)
+                    m_idx += 1
+                else:
+                    block_out = self.swa_blocks[s_idx](block_input)
+                    s_idx += 1
+
+                # H_post: distribute output → d streams + add to mixed
+                x_streams = x_mixed + hc.distribute_from_block(block_out)
+            else:
+                # standard single-stream residuals (hc_streams=1)
+                if block_type == "miras":
+                    x, state = self.miras_blocks[m_idx](x, miras_states[m_idx])
+                    new_states.append(state)
+                    m_idx += 1
+                else:
+                    x = self.swa_blocks[s_idx](x)
+                    s_idx += 1
+
+        # collapse streams and normalize
+        if use_hc:
+            x = collapse_streams(x_streams)  # (d, T, dim) → (T, dim)
+
         x = jax.vmap(self.final_norm)(x)
 
         return x, new_states
