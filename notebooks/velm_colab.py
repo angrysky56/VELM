@@ -275,6 +275,21 @@ print(f"\nPhase 1 done: {total_time/3600:.2f}h | accuracy: {final_acc:.4%}")
 # save final
 eqx.tree_serialise_leaves("checkpoints/calm_ae_final.eqx", model)
 
+# persist to Google Drive (Colab disk is ephemeral!)
+try:
+    from google.colab import drive  # noqa: E402
+    drive.mount("/content/drive", force_remount=False)
+    drive_dir = "/content/drive/MyDrive/VELM_checkpoints"
+    os.makedirs(drive_dir, exist_ok=True)
+    import shutil
+    for f in ["calm_ae_best.eqx", "calm_ae_best.json", "calm_ae_final.eqx"]:
+        src = f"checkpoints/{f}"
+        if os.path.exists(src):
+            shutil.copy2(src, f"{drive_dir}/{f}")
+    print(f"✓ Checkpoints backed up to Google Drive: {drive_dir}")
+except ImportError:
+    print("Not on Colab — checkpoints are in ./checkpoints/")
+
 # %% — 6. Plot AE training curves
 import matplotlib
 
@@ -457,6 +472,32 @@ if "model" not in dir() or model is None:
     ckpt_path = "checkpoints/calm_ae_best.eqx"
     if not os.path.exists(ckpt_path):
         ckpt_path = "checkpoints/calm_ae_final.eqx"
+    # try restoring from Google Drive if local checkpoints are gone
+    if not os.path.exists(ckpt_path):
+        try:
+            from google.colab import drive  # noqa: E402
+            drive.mount("/content/drive", force_remount=False)
+            drive_dir = "/content/drive/MyDrive/VELM_checkpoints"
+            import shutil
+            os.makedirs("checkpoints", exist_ok=True)
+            for f in os.listdir(drive_dir):
+                shutil.copy2(f"{drive_dir}/{f}", f"checkpoints/{f}")
+            print(f"  ✓ Restored checkpoints from Google Drive")
+            ckpt_path = "checkpoints/calm_ae_best.eqx"
+            if not os.path.exists(ckpt_path):
+                ckpt_path = "checkpoints/calm_ae_final.eqx"
+        except (ImportError, FileNotFoundError):
+            pass
+    if not os.path.exists(ckpt_path):
+        raise FileNotFoundError(
+            "No AE checkpoint found! Colab's disk is ephemeral — "
+            "checkpoints are lost on restart.\n"
+            "  → Re-run Phase 1 (cells 5+6) to retrain the AE (~2.7h)\n"
+            "  → Or mount Google Drive before training to persist checkpoints:\n"
+            "    from google.colab import drive; drive.mount('/content/drive')\n"
+            "    !cp -r checkpoints/ /content/drive/MyDrive/VELM_ckpts/\n"
+            "    Restore: !cp -r /content/drive/MyDrive/VELM_ckpts/ checkpoints/"
+        )
     model = eqx.tree_deserialise_leaves(ckpt_path, model)
     print(f"  ✓ Loaded: {ckpt_path}")
 frozen_ae = model
