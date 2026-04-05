@@ -19,8 +19,8 @@ Tokenizer: Qwen3.5 (248K vocab, 201 languages)
 # 4. Evaluate & save checkpoints
 
 # %% — 0. Environment Setup
-!pip install -q "jax[cuda12]" equinox jaxtyping optax einops tqdm
-!pip install -q datasets tokenizers transformers
+# !pip install -q "jax[cuda12]" equinox jaxtyping optax einops tqdm
+# !pip install -q datasets tokenizers transformers
 
 import os
 import sys
@@ -831,7 +831,7 @@ from src.evolution.gea_eggroll import (  # noqa: E402
 GEA_ITERATIONS = 10         # quality over speed
 GEA_POP = min(HW["pop"], 32)  # population per GEA generation
 GEA_GROUP = 5                # parent group size (K in GEA paper)
-GEA_SIGMA = 0.01             # perturbation scale (match EGGROLL Phase 2)
+GEA_SIGMA = SIGMA             # use same σ as EGGROLL Phase 2
 GEA_BIAS = 0.3               # parent-direction bias strength
 
 print(f"\nPhase 3: GEA Group Evolution — {GEA_ITERATIONS} iterations")
