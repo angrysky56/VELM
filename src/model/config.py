@@ -57,7 +57,7 @@ CONFIGS: dict[str, dict] = {
         "eggroll_sigma": 0.001,
         "eggroll_lr": 3e-4,
         "eggroll_antithetic": True,   # ±σ pairs: halves variance for small pop
-        "eggroll_eval_batch": 128,    # more data per eval → stabler fitness
+        "eggroll_eval_batch": 64,     # balance speed vs stability on T4
         "hc_streams": 4,             # d: number of residual streams (go-mHC)
         "hc_s": 2,                   # s: orthostochastic expressivity param
     },

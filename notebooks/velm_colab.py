@@ -429,7 +429,7 @@ POP_SIZE = HW["pop"]
 EGGROLL_STEPS = HW["egg_steps"]
 SIGMA = cfg.get("eggroll_sigma", 0.001)
 EGG_LR = cfg.get("eggroll_lr", 3e-4)
-EVAL_BATCH = cfg.get("eggroll_eval_batch", 128)  # was 32 — more data per eval
+EVAL_BATCH = cfg.get("eggroll_eval_batch", 64)  # 64: balance speed vs stability
 ANTITHETIC = cfg.get("eggroll_antithetic", True)  # ±σ pairs: halves variance
 HC_D = cfg.get("hc_streams", 1)  # go-mHC residual streams
 HC_S = cfg.get("hc_s", 2)        # go-mHC expressivity
@@ -709,8 +709,8 @@ else:
     # Progressive EGGROLL: train head first, then unfreeze backbone.
     # pop=32 on 7.2M params has ~1% SNR (noise). But pop=32 on 819K
     # head params has ~7% SNR — enough to learn.
-    HEAD_STEPS = 2000   # Phase i: head only (819K params)
-    FULL_STEPS = 3000   # Phase ii: head + backbone (7.2M params)
+    HEAD_STEPS = 1500   # Phase i: head only (819K params, faster convergence)
+    FULL_STEPS = 2000   # Phase ii: head + backbone (7.2M params)
     EGGROLL_STEPS = HEAD_STEPS + FULL_STEPS
 
     print(f"Phase 2b: Progressive EGGROLL — {EGGROLL_STEPS:,} total steps")
