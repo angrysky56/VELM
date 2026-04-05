@@ -403,6 +403,13 @@ else:
         print(f"\n⏭ Phase 1.5 skipped (CONTINUE_AE=False)")
 
 # %% — 7. Phase 2: EGGROLL Backbone Training (gradient-free)
+# Re-derive AE dimensions from config (in case Phase 1 cells were skipped)
+HIDDEN_DIM = cfg.get("ae_hidden_dim", 256)
+LATENT_DIM = cfg["latent_dim"]
+FFN_DIM = cfg.get("ae_ffn_intermediate", 512)
+KL_CLIP = cfg.get("ae_kl_clip", 0.5)
+KL_WEIGHT = cfg.get("ae_kl_weight", 0.001)
+
 POP_SIZE = HW["pop"]
 EGGROLL_STEPS = HW["egg_steps"]
 SIGMA = cfg.get("eggroll_sigma", 0.001)
@@ -438,7 +445,21 @@ if HC_D > 1:
 print(f"EGGROLL: pop={POP_SIZE}, σ={SIGMA}, steps={EGGROLL_STEPS:,}"
       f"{', antithetic' if ANTITHETIC else ''}, eval_batch={EVAL_BATCH}")
 
-frozen_ae = model  # from Phase 1
+# Load frozen AE — from Phase 1 if it ran, otherwise from checkpoint
+if "model" not in dir() or model is None:
+    print("Loading AE from checkpoint (Phase 1 was skipped)...")
+    model = CALMAutoencoder(
+        vocab_size=VOCAB_SIZE, chunk_size=K,
+        hidden_dim=HIDDEN_DIM, latent_dim=LATENT_DIM,
+        ffn_intermediate=FFN_DIM, kl_weight=KL_WEIGHT,
+        kl_clip=KL_CLIP, key=jax.random.PRNGKey(42),
+    )
+    ckpt_path = "checkpoints/calm_ae_best.eqx"
+    if not os.path.exists(ckpt_path):
+        ckpt_path = "checkpoints/calm_ae_final.eqx"
+    model = eqx.tree_deserialise_leaves(ckpt_path, model)
+    print(f"  ✓ Loaded: {ckpt_path}")
+frozen_ae = model
 
 # pack trainable params
 trainable = {
