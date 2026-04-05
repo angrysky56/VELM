@@ -684,13 +684,7 @@ def evaluate_params(params, batch):
     return jnp.where(jnp.isfinite(fitness), fitness, -1e6)
 
 
-# optimizer for ES gradient updates — clip to prevent weight explosion
-# (only used when USE_EGGROLL_PHASE=True)
-eggroll_opt = optax.chain(
-    optax.clip_by_global_norm(1.0),  # prevents the exponential divergence seen in v1
-    optax.adam(EGG_LR),
-)
-eggroll_opt_state = eggroll_opt.init(trainable)
+# (optimizers are created inside the EGGROLL loop for progressive unfreezing)
 
 # --- Warmup: compile the evaluation function ONCE before the loop ---
 print("\nCompiling backbone evaluation (one-time, may take 2-5 min on T4)...")
@@ -712,80 +706,108 @@ if not USE_EGGROLL_PHASE:
     print(f"  Backbone was trained via gradient descent in Phase 2a")
     egg_history = {"mean_fitness": [], "max_fitness": [], "grad_norm": []}
 else:
-    print(f"Phase 2b: EGGROLL training — {EGGROLL_STEPS:,} steps, pop={POP_SIZE}")
+    # Progressive EGGROLL: train head first, then unfreeze backbone.
+    # pop=32 on 7.2M params has ~1% SNR (noise). But pop=32 on 819K
+    # head params has ~7% SNR — enough to learn.
+    HEAD_STEPS = 2000   # Phase i: head only (819K params)
+    FULL_STEPS = 3000   # Phase ii: head + backbone (7.2M params)
+    EGGROLL_STEPS = HEAD_STEPS + FULL_STEPS
+
+    print(f"Phase 2b: Progressive EGGROLL — {EGGROLL_STEPS:,} total steps")
+    print(f"  Phase i:  head only ({hd_p:,} params), {HEAD_STEPS:,} steps")
+    print(f"  Phase ii: full model ({bb_p+hd_p:,} params), {FULL_STEPS:,} steps")
+    print(f"  pop={POP_SIZE}, σ={SIGMA}, antithetic={ANTITHETIC}")
     print("=" * 60)
 
-egg_history = egg_history if not USE_EGGROLL_PHASE else {
-    "mean_fitness": [], "max_fitness": [], "grad_norm": []}
+egg_history = {"mean_fitness": [], "max_fitness": [], "grad_norm": [], "phase": []}
 start = time.time()
 best_egg_fitness = -float("inf")
 
+# separate trainable sets for progressive unfreezing
+head_trainable = {"head": trainable["head"]}
+head_opt = optax.chain(
+    optax.clip_by_global_norm(1.0), optax.adam(EGG_LR))
+head_opt_state = head_opt.init(head_trainable)
+
+full_opt = optax.chain(
+    optax.clip_by_global_norm(1.0), optax.adam(EGG_LR * 0.3))  # lower lr for full
+full_opt_state = full_opt.init(trainable)
+
 for step in range(1, (EGGROLL_STEPS + 1) if USE_EGGROLL_PHASE else 0):
     key, batch_key, step_key = jax.random.split(key, 3)
-
-    # fresh batch each step — passed as argument, NOT closed over
     idx = jax.random.randint(batch_key, (EVAL_BATCH,), 0, num_chunks)
     batch = jnp.array(all_chunks[idx])
 
-    # evaluate population with antithetic sampling (±σ pairs)
+    # decide what to train this step
+    training_head_only = step <= HEAD_STEPS
+    if training_head_only:
+        active_params = head_trainable
+        phase_label = "head"
+    else:
+        # sync head params into full trainable before first full step
+        if step == HEAD_STEPS + 1:
+            trainable = {
+                "backbone": trainable["backbone"],
+                "head": head_trainable["head"],
+            }
+            full_opt_state = full_opt.init(trainable)
+            print(f"\n  >>> Unfreezing backbone at step {step} <<<\n")
+        active_params = trainable
+        phase_label = "full"
+
+    # evaluate population with antithetic sampling
     member_keys = jax.random.split(step_key, POP_SIZE)
     fitnesses_list = []
     perturbations_list = []
-    fitness_diffs = []  # for antithetic: f(+σ) - f(-σ)
+    fitness_diffs = []
 
     for member_key in member_keys:
-        _, pert = perturb_pytree(trainable, member_key, SIGMA, rank=1)
+        _, pert = perturb_pytree(active_params, member_key, SIGMA, rank=1)
 
-        if ANTITHETIC:
-            # evaluate BOTH +σ and -σ directions (halves gradient variance)
-            pos_params = jax.tree.map(
-                lambda p, e: p + SIGMA * e, trainable, pert)
-            neg_params = jax.tree.map(
-                lambda p, e: p - SIGMA * e, trainable, pert)
-            f_pos = evaluate_params(pos_params, batch)
-            f_neg = evaluate_params(neg_params, batch)
-            fitnesses_list.append((f_pos + f_neg) / 2)  # for logging
-            fitness_diffs.append(f_pos - f_neg)
+        if training_head_only:
+            # perturb head only, backbone stays frozen
+            pos_full = {"backbone": trainable["backbone"],
+                        "head": jax.tree.map(lambda p, e: p + SIGMA * e,
+                                             active_params["head"], pert["head"])}
+            neg_full = {"backbone": trainable["backbone"],
+                        "head": jax.tree.map(lambda p, e: p - SIGMA * e,
+                                             active_params["head"], pert["head"])}
         else:
-            fit, _ = evaluate_member(trainable, member_key, batch)
-            fitnesses_list.append(fit)
+            pos_full = jax.tree.map(
+                lambda p, e: p + SIGMA * e, active_params, pert)
+            neg_full = jax.tree.map(
+                lambda p, e: p - SIGMA * e, active_params, pert)
 
+        f_pos = evaluate_params(pos_full, batch)
+        f_neg = evaluate_params(neg_full, batch)
+        fitnesses_list.append((f_pos + f_neg) / 2)
+        fitness_diffs.append(f_pos - f_neg)
         perturbations_list.append(pert)
 
     fitnesses_arr = jnp.array(fitnesses_list)
+    diffs_arr = jnp.array(fitness_diffs)
 
-    # ES gradient computation
+    # antithetic ES gradient
     leaves_list = [jax.tree.leaves(p) for p in perturbations_list]
     treedef = jax.tree.structure(perturbations_list[0])
     es_grad_leaves = []
+    for j in range(len(leaves_list[0])):
+        stacked = jnp.stack([ll[j] for ll in leaves_list], axis=0)
+        w = diffs_arr.reshape((-1,) + (1,) * (stacked.ndim - 1))
+        es_grad_leaves.append(jnp.sum(stacked * w, axis=0))
+    es_grad = jax.tree.unflatten(treedef, es_grad_leaves)
+    neg_grad = jax.tree.map(
+        lambda g: g * (-1.0 / (2.0 * SIGMA * POP_SIZE)), es_grad)
 
-    if ANTITHETIC:
-        # antithetic gradient: (1/2σN) Σ (f+ - f-) * E
-        diffs_arr = jnp.array(fitness_diffs)
-        for j in range(len(leaves_list[0])):
-            stacked = jnp.stack([ll[j] for ll in leaves_list], axis=0)
-            w = diffs_arr.reshape((-1,) + (1,) * (stacked.ndim - 1))
-            es_grad_leaves.append(jnp.sum(stacked * w, axis=0))
-        es_grad = jax.tree.unflatten(treedef, es_grad_leaves)
-        scale = -1.0 / (2.0 * SIGMA * POP_SIZE)
+    # Adam update on the active param set
+    if training_head_only:
+        updates, head_opt_state = head_opt.update(
+            neg_grad, head_opt_state, head_trainable)
+        head_trainable = optax.apply_updates(head_trainable, updates)
     else:
-        # rank-based gradient (original, less efficient for small pop)
-        ranks = jnp.argsort(jnp.argsort(fitnesses_arr)).astype(jnp.float32)
-        normalized = 0.5 - ranks / (POP_SIZE - 1)
-        for j in range(len(leaves_list[0])):
-            stacked = jnp.stack([ll[j] for ll in leaves_list], axis=0)
-            w = normalized.reshape((-1,) + (1,) * (stacked.ndim - 1))
-            es_grad_leaves.append(jnp.sum(stacked * w, axis=0))
-        es_grad = jax.tree.unflatten(treedef, es_grad_leaves)
-        scale = -1.0 / (SIGMA * POP_SIZE)
-
-    neg_grad = jax.tree.map(lambda g: g * scale, es_grad)
-
-    # Adam update
-    updates, eggroll_opt_state = eggroll_opt.update(
-        neg_grad, eggroll_opt_state, trainable
-    )
-    trainable = optax.apply_updates(trainable, updates)
+        updates, full_opt_state = full_opt.update(
+            neg_grad, full_opt_state, trainable)
+        trainable = optax.apply_updates(trainable, updates)
 
     # logging every 100 steps
     if step % 100 == 0:
@@ -797,8 +819,9 @@ for step in range(1, (EGGROLL_STEPS + 1) if USE_EGGROLL_PHASE else 0):
         egg_history["mean_fitness"].append(mf)
         egg_history["max_fitness"].append(xf)
         egg_history["grad_norm"].append(gn)
+        egg_history["phase"].append(phase_label)
         elapsed = time.time() - start
-        print(f"  step {step:>5}/{EGGROLL_STEPS} | "
+        print(f"  step {step:>5}/{EGGROLL_STEPS} [{phase_label:>4}] | "
               f"mean_f: {mf:.4f} | max_f: {xf:.4f} | "
               f"grad: {gn:.4f} | {elapsed/60:.0f}m")
 
@@ -815,8 +838,14 @@ for step in range(1, (EGGROLL_STEPS + 1) if USE_EGGROLL_PHASE else 0):
     if step % 500 == 0:
         cur_fitness = float(jnp.mean(fitnesses_arr))
         os.makedirs("checkpoints", exist_ok=True)
-        ckpt_bb = eqx.combine(trainable["backbone"], _bb_static)
-        ckpt_hd = eqx.combine(trainable["head"], _hd_static)
+        # sync head into trainable if still in head-only phase
+        if training_head_only:
+            save_params = {"backbone": trainable["backbone"],
+                           "head": head_trainable["head"]}
+        else:
+            save_params = trainable
+        ckpt_bb = eqx.combine(save_params["backbone"], _bb_static)
+        ckpt_hd = eqx.combine(save_params["head"], _hd_static)
         eqx.tree_serialise_leaves(f"checkpoints/backbone_step{step}.eqx", ckpt_bb)
         eqx.tree_serialise_leaves(f"checkpoints/head_step{step}.eqx", ckpt_hd)
         if cur_fitness > best_egg_fitness:
@@ -827,6 +856,11 @@ for step in range(1, (EGGROLL_STEPS + 1) if USE_EGGROLL_PHASE else 0):
 
 elapsed = time.time() - start
 print(f"\nPhase 2 done: {elapsed/3600:.2f}h")
+
+# sync final head params if still in head-only phase
+if USE_EGGROLL_PHASE and "head" in head_trainable:
+    trainable = {"backbone": trainable["backbone"],
+                 "head": head_trainable["head"]}
 
 # save final
 final_bb = eqx.combine(trainable["backbone"], _bb_static)
