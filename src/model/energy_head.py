@@ -165,8 +165,11 @@ class EnergyHead(eqx.Module):
             for block in self.blocks:
                 eps_l = block(eps_l, h_proj)
 
-            # project to latent dim
-            return self.to_latent(eps_l)
+            # project to latent dim and force spherical manifold
+            z_raw = self.to_latent(eps_l)
+            z_norm = z_raw / (jnp.linalg.norm(z_raw) + 1e-8)
+            radius = jnp.sqrt(self.latent_dim)
+            return z_norm * radius
 
         # generate num_samples in parallel
         sample_keys = jax.random.split(key, num_samples)
@@ -205,19 +208,21 @@ def energy_score(
     """
     n = samples.shape[0]
 
+    def cosine_dist(x, y):
+        x_norm = x / (jnp.linalg.norm(x, axis=-1, keepdims=True) + 1e-8)
+        y_norm = y / (jnp.linalg.norm(y, axis=-1, keepdims=True) + 1e-8)
+        sim = jnp.sum(x_norm * y_norm, axis=-1)
+        return 1.0 - sim  # bounded [0, 2]
+
     # term 1: mean distance from samples to target
-    # (2/N) Σ_i ||z_i - z*||^α
-    # jnp.linalg.norm(x) has a NaN gradient at x=0. Use sqrt(x^2 + eps).
-    diffs_to_target = jnp.sqrt(jnp.sum((samples - target[None, :]) ** 2, axis=-1) + 1e-8)  # (N,)
+    # (2/N) Σ_i d_cos(z_i, z*)^α
+    diffs_to_target = cosine_dist(samples, target[None, :])  # (N,)
     term1 = (2.0 / n) * jnp.sum(diffs_to_target ** alpha)
 
     # term 2: mean pairwise distance between samples
-    # (1/N²) Σ_{i,j} ||z_i - z_j||^α
-    # compute pairwise distances efficiently
-    diffs_pairwise = samples[:, None, :] - samples[None, :, :]  # (N, N, l)
-    # Diagonal is exactly 0, which causes NaN gradients in norm.
-    pairwise_dists = jnp.sqrt(jnp.sum(diffs_pairwise ** 2, axis=-1) + 1e-8)  # (N, N)
-    term2 = (1.0 / (n * n)) * jnp.sum(pairwise_dists ** alpha)
+    # (1/N²) Σ_{i,j} d_cos(z_i, z_j)^α
+    diffs_pairwise = cosine_dist(samples[:, None, :], samples[None, :, :])  # (N, N)
+    term2 = (1.0 / (n * n)) * jnp.sum(diffs_pairwise ** alpha)
 
     # numerical safety: return large but finite value if NaN
     result = term1 - term2

@@ -122,6 +122,7 @@ class MirasMemoryLayer(eqx.Module):
     head_dim: int
     num_heads: int
     low_rank_dim: int
+    frobenius_capacity: float
 
     def __init__(
         self,
@@ -162,6 +163,9 @@ class MirasMemoryLayer(eqx.Module):
 
         # output gate
         self.gate_proj = eqx.nn.Linear(dim, dim, use_bias=False, key=keys[11])
+
+        # structural capacity ceiling for associative memory
+        self.frobenius_capacity = jnp.sqrt(dim * dim)
 
     def _compute_eta(self, x: Float[Array, "dim"]) -> Float[Array, "dim"]:
         """Channel-wise learning rate via low-rank projection + sigmoid."""
@@ -212,8 +216,10 @@ class MirasMemoryLayer(eqx.Module):
         # apply α and η as diagonal scaling on rows
         new_state = alpha[:, None] * state - eta[:, None] * grad
 
-        # numerical stability: clamp state to prevent explosion in long scans
-        new_state = jnp.clip(new_state, -10.0, 10.0)
+        # adaptive Frobenius clipping: structurally bound memory capacity
+        state_norm = jnp.linalg.norm(new_state, ord="fro")
+        scale = jnp.maximum(1.0, state_norm / self.frobenius_capacity)
+        new_state = new_state / scale
 
         # readout from updated memory
         output = new_state @ k_t  # (dim,)
