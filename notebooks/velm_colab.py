@@ -502,6 +502,56 @@ if "model" not in dir() or model is None:
     print(f"  ✓ Loaded: {ckpt_path}")
 frozen_ae = model
 
+# %% — 7.5. Extract teacher vectors from Qwen3.5-0.8B
+# The teacher model is already loaded as our tokenizer source.
+# We extract its hidden states and project them to VELM's latent space.
+# This gives the backbone 0.8B-quality supervision at 7M inference cost.
+
+print("\nExtracting teacher vectors from Qwen3.5-0.8B...")
+import torch
+from transformers import AutoModelForCausalLM
+
+teacher_device = "cuda" if torch.cuda.is_available() else "cpu"
+teacher_model = AutoModelForCausalLM.from_pretrained(
+    DEFAULT_TOKENIZER, trust_remote_code=True,
+    torch_dtype=torch.float16 if teacher_device == "cuda" else torch.float32,
+).to(teacher_device).eval()
+TEACHER_DIM = teacher_model.config.hidden_size
+print(f"  Teacher: {DEFAULT_TOKENIZER} | dim={TEACHER_DIM} | device={teacher_device}")
+
+# extract hidden states for all training chunks (batched)
+TEACHER_BATCH = 128
+teacher_hiddens = []
+for start in range(0, num_chunks, TEACHER_BATCH):
+    end = min(start + TEACHER_BATCH, num_chunks)
+    batch_ids = all_chunks[start:end]
+    with torch.no_grad():
+        input_ids = torch.tensor(
+            np.array(batch_ids), dtype=torch.long, device=teacher_device)
+        outputs = teacher_model(input_ids=input_ids, output_hidden_states=True)
+        # last layer hidden: (B, K, teacher_dim) → mean pool → (B, teacher_dim)
+        last_hidden = outputs.hidden_states[-1].mean(dim=1)
+        teacher_hiddens.append(last_hidden.cpu().numpy())
+
+all_teacher_vecs = np.concatenate(teacher_hiddens, axis=0)  # (N, teacher_dim)
+print(f"  ✓ Extracted {all_teacher_vecs.shape[0]:,} teacher vectors "
+      f"({all_teacher_vecs.shape[1]}d)")
+
+# free GPU memory for teacher model
+del teacher_model
+if torch.cuda.is_available():
+    torch.cuda.empty_cache()
+print("  ✓ Teacher model unloaded, GPU memory freed")
+
+# create teacher projection: teacher_dim → backbone_dim
+from src.training.distillation import TeacherProjection  # noqa: E402
+k_proj, key = jax.random.split(key)
+teacher_proj = TeacherProjection(TEACHER_DIM, cfg["hidden_dim"], key=k_proj)
+
+# add projection to trainable params
+trainable["teacher_proj"] = eqx.filter(teacher_proj, eqx.is_array)
+_tp_static = eqx.filter(teacher_proj, lambda x: not eqx.is_array(x))
+
 # pack trainable params
 trainable = {
     "backbone": eqx.filter(backbone, eqx.is_array),
@@ -518,14 +568,15 @@ _hd_static = eqx.filter(head, lambda x: not eqx.is_array(x))
 # ES with pop=32 on 7M params (SNR ≈ 0.012).
 # EGGROLL is preserved below as Phase 2b for future nonlinear recurrence.
 
-USE_GRADIENT_PHASE = False  # optional warmup only — EGGROLL is primary
+USE_GRADIENT_PHASE = True  # gradient + distillation is primary for current scale
 GRAD_STEPS = 20_000
 GRAD_LR = 3e-4
 GRAD_BATCH = EVAL_BATCH  # 32 chunks per step
 
 if USE_GRADIENT_PHASE:
-    print(f"\nPhase 2a: Gradient-based backbone + head training")
+    print(f"\nPhase 2a: Gradient training with teacher distillation")
     print(f"  {GRAD_STEPS:,} steps, batch={GRAD_BATCH}, lr={GRAD_LR}")
+    print(f"  Energy weight: 1.0 | Distillation weight: 0.5")
     print("=" * 60)
 
     grad_schedule = optax.warmup_cosine_decay_schedule(
@@ -539,11 +590,12 @@ if USE_GRADIENT_PHASE:
     grad_opt_state = grad_optimizer.init(trainable)
 
     @eqx.filter_jit
-    def grad_train_step(params, opt_st, batch_tokens, step_key):
-        """Gradient-based backbone + energy head training step."""
+    def grad_train_step(params, opt_st, batch_tokens, batch_teacher, step_key):
+        """Gradient training: energy loss + teacher distillation."""
         def loss_fn(p):
             bb = eqx.combine(p["backbone"], _bb_static)
             hd = eqx.combine(p["head"], _hd_static)
+            tp = eqx.combine(p["teacher_proj"], _tp_static)
             # encode chunks → target latents via frozen AE
             tgt_z = jax.vmap(
                 lambda c: frozen_ae.encode(c, training=False)[0])(batch_tokens)
@@ -560,21 +612,32 @@ if USE_GRADIENT_PHASE:
                 samples = hd(h, key=k, num_samples=8)
                 return energy_score(samples, z_t)
             keys = jax.random.split(step_key, hid_in.shape[0])
-            losses = jax.vmap(pos_loss)(hid_in, z_target, keys)
-            return jnp.mean(losses)
+            e_losses = jax.vmap(pos_loss)(hid_in, z_target, keys)
+            e_loss = jnp.mean(e_losses)
+            # distillation loss: align backbone hidden with teacher
+            teacher_targets = jax.vmap(tp)(batch_teacher)  # (B, dim)
+            n = min(hid.shape[0], teacher_targets.shape[0])
+            d_loss = jnp.mean(jnp.sum(
+                (hid[:n] - teacher_targets[:n]) ** 2, axis=-1))
+            return e_loss + 0.5 * d_loss, {
+                "energy_loss": e_loss, "distill_loss": d_loss}
 
-        loss_val, grads = eqx.filter_value_and_grad(loss_fn)(params)
+        (loss_val, metrics), grads = eqx.filter_value_and_grad(
+            loss_fn, has_aux=True)(params)
         updates, new_opt = grad_optimizer.update(grads, opt_st, params)
         new_params = optax.apply_updates(params, updates)
-        return new_params, new_opt, loss_val
+        return new_params, new_opt, loss_val, metrics
 
     # compile warmup
-    print("Compiling gradient training step (one-time)...")
+    print("Compiling gradient + distillation step (one-time)...")
     _w_batch = jnp.array(all_chunks[:GRAD_BATCH])
+    _w_teacher = jnp.array(all_teacher_vecs[:GRAD_BATCH])
     _w_key = jax.random.PRNGKey(0)
-    _, _, _w_loss = grad_train_step(trainable, grad_opt_state, _w_batch, _w_key)
+    _, _, _w_loss, _w_metrics = grad_train_step(
+        trainable, grad_opt_state, _w_batch, _w_teacher, _w_key)
     _w_loss.block_until_ready()
-    print(f"✓ Compiled | initial energy loss: {float(_w_loss):.4f}\n")
+    print(f"✓ Compiled | initial energy: {float(_w_metrics['energy_loss']):.4f}"
+          f" | distill: {float(_w_metrics['distill_loss']):.4f}\n")
 
     grad_history = {"energy_loss": []}
     grad_start = time.time()
@@ -584,18 +647,22 @@ if USE_GRADIENT_PHASE:
         key, batch_key, step_key = jax.random.split(key, 3)
         idx = jax.random.randint(batch_key, (GRAD_BATCH,), 0, num_chunks)
         batch = jnp.array(all_chunks[idx])
-        trainable, grad_opt_state, eloss = grad_train_step(
-            trainable, grad_opt_state, batch, step_key)
+        batch_teacher = jnp.array(all_teacher_vecs[idx])
+        trainable, grad_opt_state, loss, metrics = grad_train_step(
+            trainable, grad_opt_state, batch, batch_teacher, step_key)
 
         if step % 200 == 0:
-            el = float(eloss)
+            el = float(metrics["energy_loss"])
+            dl = float(metrics["distill_loss"])
+            tl = float(loss)
             grad_history["energy_loss"].append(el)
             elapsed = time.time() - grad_start
             marker = ""
-            if el < best_grad_loss:
-                best_grad_loss = el
+            if tl < best_grad_loss:
+                best_grad_loss = tl
                 marker = " ★"
-            print(f"  step {step:>5}/{GRAD_STEPS} | energy: {el:.4f}{marker} | "
+            print(f"  step {step:>5}/{GRAD_STEPS} | energy: {el:.4f} | "
+                  f"distill: {dl:.4f} | total: {tl:.4f}{marker} | "
                   f"{step/elapsed:.1f} steps/s | {elapsed/60:.0f}m")
 
         if step % 2000 == 0:
@@ -623,7 +690,7 @@ if USE_GRADIENT_PHASE:
 # Skip this if gradient-based Phase 2a already trained the backbone.
 # EGGROLL is preserved for future nonlinear recurrence where backprop is
 # impractical (true BPTT over long sequences with nonlinear Miras memory).
-USE_EGGROLL_PHASE = True  # EGGROLL is the primary training method
+USE_EGGROLL_PHASE = False  # EGGROLL for GEA only — distillation is primary
 
 
 
