@@ -234,6 +234,21 @@ start_time = time.time()
 num_chunks = all_chunks.shape[0]
 best_acc = 0.0
 
+# Try restoring checkpoints from Google Drive first (Colab wipes local disk)
+if not os.path.exists("checkpoints/calm_ae_best.eqx"):
+    try:
+        from google.colab import drive  # noqa: E402
+        drive.mount("/content/drive", force_remount=False)
+        drive_dir = "/content/drive/MyDrive/VELM_checkpoints"
+        if os.path.isdir(drive_dir):
+            import shutil
+            os.makedirs("checkpoints", exist_ok=True)
+            for fname in os.listdir(drive_dir):
+                shutil.copy2(f"{drive_dir}/{fname}", f"checkpoints/{fname}")
+            print("  ✓ Restored checkpoints from Google Drive")
+    except (ImportError, FileNotFoundError, OSError):
+        pass  # Not on Colab or no Drive checkpoints
+
 SKIP_AE = False
 if os.path.exists("checkpoints/calm_ae_best.json") and os.path.exists("checkpoints/calm_ae_best.eqx"):
     try:
@@ -553,7 +568,7 @@ for start in range(0, num_chunks, TEACHER_BATCH):
         outputs = teacher_model(input_ids=input_ids, output_hidden_states=True)
         # last layer hidden: (B, K, teacher_dim) → mean pool → (B, teacher_dim)
         last_hidden = outputs.hidden_states[-1].mean(dim=1)
-        teacher_hiddens.append(last_hidden.cpu().numpy())
+        teacher_hiddens.append(last_hidden.float().cpu().numpy())
 
 all_teacher_vecs = np.concatenate(teacher_hiddens, axis=0)  # (N, teacher_dim)
 print(f"  ✓ Extracted {all_teacher_vecs.shape[0]:,} teacher vectors "
