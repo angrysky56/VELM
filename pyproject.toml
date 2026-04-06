@@ -18,7 +18,7 @@ dependencies = [
     "wandb>=0.19",
     "datasets>=3.0",
     "tokenizers>=0.21",
-    "transformers>=4.40",
+    "transformers>=5.5.0",
     "matplotlib>=3.10.8",
 ]
 
