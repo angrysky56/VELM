@@ -207,14 +207,16 @@ def energy_score(
 
     # term 1: mean distance from samples to target
     # (2/N) Σ_i ||z_i - z*||^α
-    diffs_to_target = jnp.linalg.norm(samples - target[None, :], axis=-1)  # (N,)
+    # jnp.linalg.norm(x) has a NaN gradient at x=0. Use sqrt(x^2 + eps).
+    diffs_to_target = jnp.sqrt(jnp.sum((samples - target[None, :]) ** 2, axis=-1) + 1e-8)  # (N,)
     term1 = (2.0 / n) * jnp.sum(diffs_to_target ** alpha)
 
     # term 2: mean pairwise distance between samples
     # (1/N²) Σ_{i,j} ||z_i - z_j||^α
     # compute pairwise distances efficiently
     diffs_pairwise = samples[:, None, :] - samples[None, :, :]  # (N, N, l)
-    pairwise_dists = jnp.linalg.norm(diffs_pairwise, axis=-1)  # (N, N)
+    # Diagonal is exactly 0, which causes NaN gradients in norm.
+    pairwise_dists = jnp.sqrt(jnp.sum(diffs_pairwise ** 2, axis=-1) + 1e-8)  # (N, N)
     term2 = (1.0 / (n * n)) * jnp.sum(pairwise_dists ** alpha)
 
     # numerical safety: return large but finite value if NaN
