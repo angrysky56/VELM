@@ -566,11 +566,24 @@ for start in tqdm(range(0, num_chunks, TEACHER_BATCH), desc="  Extracting teache
         input_ids = torch.tensor(
             np.array(batch_ids), dtype=torch.long, device=teacher_device)
         outputs = teacher_model(input_ids=input_ids, output_hidden_states=True)
-        # last layer hidden: (B, K, teacher_dim) → mean pool → (B, teacher_dim)
-        last_hidden = outputs.hidden_states[-1].mean(dim=1)
-        teacher_hiddens.append(last_hidden.float().cpu().numpy())
+        # convert to float32 BEFORE mean-pooling (float16 overflow → NaN)
+        last_hidden = outputs.hidden_states[-1].float().mean(dim=1)
+        teacher_hiddens.append(last_hidden.cpu().numpy())
 
 all_teacher_vecs = np.concatenate(teacher_hiddens, axis=0)  # (N, teacher_dim)
+
+# sanity check: no NaN/inf in teacher vectors
+nan_count = np.sum(~np.isfinite(all_teacher_vecs))
+if nan_count > 0:
+    print(f"  ⚠ {nan_count} non-finite values in teacher vectors — replacing with 0")
+    all_teacher_vecs = np.nan_to_num(all_teacher_vecs, nan=0.0, posinf=0.0, neginf=0.0)
+
+# normalize teacher vectors to unit variance (prevents distillation loss overflow)
+teacher_std = np.std(all_teacher_vecs)
+if teacher_std > 0:
+    all_teacher_vecs = all_teacher_vecs / teacher_std
+    print(f"  Normalized teacher vectors (std was {teacher_std:.2f}, now 1.0)")
+
 print(f"  ✓ Extracted {all_teacher_vecs.shape[0]:,} teacher vectors "
       f"({all_teacher_vecs.shape[1]}d)")
 
@@ -654,8 +667,11 @@ if USE_GRADIENT_PHASE:
             # distillation loss: align backbone hidden with teacher
             teacher_targets = jax.vmap(tp)(batch_teacher)  # (B, dim)
             n = min(hid.shape[0], teacher_targets.shape[0])
-            d_loss = jnp.mean(jnp.sum(
-                (hid[:n] - teacher_targets[:n]) ** 2, axis=-1))
+            # use mean over BOTH batch and dim (not sum over dim — overflows)
+            d_loss = jnp.mean((hid[:n] - teacher_targets[:n]) ** 2)
+            # NaN guard
+            d_loss = jnp.where(jnp.isfinite(d_loss), d_loss, 0.0)
+            e_loss = jnp.where(jnp.isfinite(e_loss), e_loss, 100.0)
             return e_loss + 0.5 * d_loss, {
                 "energy_loss": e_loss, "distill_loss": d_loss}
 
