@@ -12,11 +12,31 @@ Tokenizer: Qwen3.5 (248K vocab, 201 languages)
 # %% [markdown]
 # # VELM: Vector-Evolution Language Model — Training
 #
+# ## RUNBOOK: What to run and when
+#
+# **Fresh start (no checkpoints):** Run ALL cells 0→11 in order.
+#
+# **After Colab restart (AE already trained):**
+# 1. Run cells 0-4 (setup, imports, config, tokenizer, data) — always needed
+# 2. Skip cells 5, 6, 6.5 (AE training) — loads from Google Drive automatically
+# 3. Run cell 7 (Phase 2 setup) — creates backbone+head, loads AE from Drive
+# 4. Run cell 7.5 (teacher vectors) — loads from Drive if cached, else extracts
+# 5. Run cell 7a (gradient + distillation training) — the main training
+# 6. Skip cell 7b (EGGROLL) — disabled by default
+# 7. Run cells 9+ (GEA, evaluation) — optional
+#
+# **All artifacts persist to Google Drive automatically:**
+# - `VELM_checkpoints/calm_ae_best.eqx` — trained autoencoder
+# - `VELM_checkpoints/teacher_vectors.npy` — extracted teacher hidden states
+# - `VELM_checkpoints/backbone_grad.eqx` — trained backbone
+# - `VELM_checkpoints/energy_head_grad.eqx` — trained energy head
+#
 # **Phases:**
 # 1. Stream & tokenize OpenWebMath with Qwen3.5 tokenizer
 # 2. Train CALM autoencoder → >99.9% token reconstruction
-# 3. Train backbone + energy head via EGGROLL (gradient-free ES)
-# 4. Evaluate & save checkpoints
+# 3. Extract teacher vectors from Qwen3.5-0.8B (cached to Drive)
+# 4. Train backbone + head via gradient descent + teacher distillation
+# 5. Evaluate & save checkpoints
 
 # %% — 0. Environment Setup
 # !pip install -q "jax[cuda12]" equinox jaxtyping optax einops tqdm
@@ -540,58 +560,87 @@ if "model" not in dir() or model is None:
 frozen_ae = model
 
 # %% — 7.5. Extract teacher vectors from Qwen3.5-0.8B
-# The teacher model is already loaded as our tokenizer source.
-# We extract its hidden states and project them to VELM's latent space.
-# This gives the backbone 0.8B-quality supervision at 7M inference cost.
+# Extracts hidden states and saves to Drive so you never re-run this.
+# On restart: loads from Drive automatically.
 
-print("\nExtracting teacher vectors from Qwen3.5-0.8B...")
-import torch
-from transformers import AutoModelForCausalLM
+TEACHER_CACHE = "checkpoints/teacher_vectors.npy"
 
-teacher_device = "cuda" if torch.cuda.is_available() else "cpu"
-teacher_model = AutoModelForCausalLM.from_pretrained(
-    DEFAULT_TOKENIZER, trust_remote_code=True,
-    torch_dtype=torch.float16 if teacher_device == "cuda" else torch.float32,
-).to(teacher_device).eval()
-TEACHER_DIM = teacher_model.config.hidden_size
-print(f"  Teacher: {DEFAULT_TOKENIZER} | dim={TEACHER_DIM} | device={teacher_device}")
+# try loading cached teacher vectors first
+_loaded_teacher = False
+if os.path.exists(TEACHER_CACHE):
+    all_teacher_vecs = np.load(TEACHER_CACHE)
+    TEACHER_DIM = all_teacher_vecs.shape[1]
+    print(f"✓ Loaded cached teacher vectors: {all_teacher_vecs.shape} from {TEACHER_CACHE}")
+    _loaded_teacher = True
+else:
+    # try Google Drive
+    try:
+        from google.colab import drive  # noqa: E402
+        drive.mount("/content/drive", force_remount=False)
+        drive_path = "/content/drive/MyDrive/VELM_checkpoints/teacher_vectors.npy"
+        if os.path.exists(drive_path):
+            import shutil
+            os.makedirs("checkpoints", exist_ok=True)
+            shutil.copy2(drive_path, TEACHER_CACHE)
+            all_teacher_vecs = np.load(TEACHER_CACHE)
+            TEACHER_DIM = all_teacher_vecs.shape[1]
+            print(f"✓ Restored teacher vectors from Google Drive: {all_teacher_vecs.shape}")
+            _loaded_teacher = True
+    except (ImportError, FileNotFoundError):
+        pass
 
-# extract hidden states for all training chunks (batched)
-TEACHER_BATCH = 64
-teacher_hiddens = []
-for start in tqdm(range(0, num_chunks, TEACHER_BATCH), desc="  Extracting teacher vectors"):
-    end = min(start + TEACHER_BATCH, num_chunks)
-    batch_ids = all_chunks[start:end]
-    with torch.no_grad():
-        input_ids = torch.tensor(
-            np.array(batch_ids), dtype=torch.long, device=teacher_device)
-        outputs = teacher_model(input_ids=input_ids, output_hidden_states=True)
-        # convert to float32 BEFORE mean-pooling (float16 overflow → NaN)
-        last_hidden = outputs.hidden_states[-1].float().mean(dim=1)
-        teacher_hiddens.append(last_hidden.cpu().numpy())
-
-all_teacher_vecs = np.concatenate(teacher_hiddens, axis=0)  # (N, teacher_dim)
-
-# sanity check: no NaN/inf in teacher vectors
-nan_count = np.sum(~np.isfinite(all_teacher_vecs))
-if nan_count > 0:
-    print(f"  ⚠ {nan_count} non-finite values in teacher vectors — replacing with 0")
-    all_teacher_vecs = np.nan_to_num(all_teacher_vecs, nan=0.0, posinf=0.0, neginf=0.0)
-
-# normalize teacher vectors to unit variance (prevents distillation loss overflow)
-teacher_std = np.std(all_teacher_vecs)
-if teacher_std > 0:
-    all_teacher_vecs = all_teacher_vecs / teacher_std
-    print(f"  Normalized teacher vectors (std was {teacher_std:.2f}, now 1.0)")
-
-print(f"  ✓ Extracted {all_teacher_vecs.shape[0]:,} teacher vectors "
-      f"({all_teacher_vecs.shape[1]}d)")
-
-# free GPU memory for teacher model
-del teacher_model
-if torch.cuda.is_available():
-    torch.cuda.empty_cache()
-print("  ✓ Teacher model unloaded, GPU memory freed")
+if not _loaded_teacher:
+    import torch
+    from transformers import AutoModelForCausalLM
+    print("\nExtracting teacher vectors from Qwen3.5-0.8B...")
+    teacher_device = "cuda" if torch.cuda.is_available() else "cpu"
+    teacher_model = AutoModelForCausalLM.from_pretrained(
+        DEFAULT_TOKENIZER, trust_remote_code=True,
+        torch_dtype=torch.float16 if teacher_device == "cuda" else torch.float32,
+    ).to(teacher_device).eval()
+    TEACHER_DIM = teacher_model.config.hidden_size
+    print(f"  Teacher: {DEFAULT_TOKENIZER} | dim={TEACHER_DIM} | device={teacher_device}")
+    TEACHER_BATCH = 64
+    teacher_hiddens = []
+    for start in tqdm(range(0, num_chunks, TEACHER_BATCH),
+                      desc="  Extracting"):
+        end = min(start + TEACHER_BATCH, num_chunks)
+        batch_ids = all_chunks[start:end]
+        with torch.no_grad():
+            input_ids = torch.tensor(
+                np.array(batch_ids), dtype=torch.long, device=teacher_device)
+            outputs = teacher_model(
+                input_ids=input_ids, output_hidden_states=True)
+            last_hidden = outputs.hidden_states[-1].float().mean(dim=1)
+            teacher_hiddens.append(last_hidden.cpu().numpy())
+    all_teacher_vecs = np.concatenate(teacher_hiddens, axis=0)
+    nan_count = np.sum(~np.isfinite(all_teacher_vecs))
+    if nan_count > 0:
+        print(f"  ⚠ {nan_count} non-finite values — replacing with 0")
+        all_teacher_vecs = np.nan_to_num(
+            all_teacher_vecs, nan=0.0, posinf=0.0, neginf=0.0)
+    teacher_std = np.std(all_teacher_vecs)
+    if teacher_std > 0:
+        all_teacher_vecs = all_teacher_vecs / teacher_std
+        print(f"  Normalized (std was {teacher_std:.2f})")
+    # save locally and to Drive
+    os.makedirs("checkpoints", exist_ok=True)
+    np.save(TEACHER_CACHE, all_teacher_vecs)
+    try:
+        from google.colab import drive
+        drive.mount("/content/drive", force_remount=False)
+        drive_dir = "/content/drive/MyDrive/VELM_checkpoints"
+        os.makedirs(drive_dir, exist_ok=True)
+        import shutil
+        shutil.copy2(TEACHER_CACHE, f"{drive_dir}/teacher_vectors.npy")
+        print(f"  ✓ Saved to Drive: {drive_dir}/teacher_vectors.npy")
+    except ImportError:
+        pass
+    del teacher_model
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    print(f"  ✓ {all_teacher_vecs.shape[0]:,} vectors ({all_teacher_vecs.shape[1]}d)")
+    TEACHER_DIM = all_teacher_vecs.shape[1]
 
 # pack trainable params
 trainable = {
@@ -738,6 +787,19 @@ if USE_GRADIENT_PHASE:
     eqx.tree_serialise_leaves("checkpoints/backbone_grad.eqx", final_bb)
     eqx.tree_serialise_leaves("checkpoints/energy_head_grad.eqx", final_hd)
     print("✓ Saved: checkpoints/backbone_grad.eqx + energy_head_grad.eqx")
+
+    # persist to Google Drive
+    try:
+        from google.colab import drive
+        drive.mount("/content/drive", force_remount=False)
+        drive_dir = "/content/drive/MyDrive/VELM_checkpoints"
+        os.makedirs(drive_dir, exist_ok=True)
+        import shutil
+        for f in ["backbone_grad.eqx", "energy_head_grad.eqx"]:
+            shutil.copy2(f"checkpoints/{f}", f"{drive_dir}/{f}")
+        print(f"✓ Backbone + head backed up to Drive")
+    except ImportError:
+        pass
 
 # %% — 7b. Phase 2b: EGGROLL fine-tuning (gradient-free, optional)
 # Skip this if gradient-based Phase 2a already trained the backbone.
