@@ -20,10 +20,13 @@ Tokenizer: Qwen3.5 (248K vocab, 201 languages)
 
 # %% — 0. Environment Setup
 # !pip install -q "jax[cuda12]" equinox jaxtyping optax einops tqdm
-# !pip install -q datasets tokenizers transformers
+# !pip install -q datasets tokenizers transformers==5.5.0 flash-linear-attention
 
 import os
 import sys
+
+os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
+os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = "0.7"
 
 import jax
 import jax.numpy as jnp
@@ -230,6 +233,25 @@ history = {"loss": [], "recon": [], "kl": [], "accuracy": []}
 start_time = time.time()
 num_chunks = all_chunks.shape[0]
 best_acc = 0.0
+
+SKIP_AE = False
+if os.path.exists("checkpoints/calm_ae_best.json") and os.path.exists("checkpoints/calm_ae_best.eqx"):
+    try:
+        import json
+        with open("checkpoints/calm_ae_best.json", "r", encoding="utf-8") as f:
+            meta = json.load(f)
+        if meta.get("accuracy", 0.0) >= 0.999:
+            print(f"\n✓ Found fully trained AE checkpoint! (accuracy: {meta['accuracy']:.4%})")
+            print("  Skipping Phase 1 training.")
+            model = eqx.tree_deserialise_leaves("checkpoints/calm_ae_best.eqx", model)
+            SKIP_AE = True
+            best_acc = meta["accuracy"]
+            history["accuracy"].append(best_acc)
+    except Exception as e:
+        print("  Could not read checkpoint metadata, training normally:", e)
+
+if SKIP_AE:
+    AE_STEPS = 0  # Skip the loop entirely
 
 for step in range(1, AE_STEPS + 1):
     key, batch_key, step_key = jax.random.split(key, 3)
@@ -520,7 +542,7 @@ TEACHER_DIM = teacher_model.config.hidden_size
 print(f"  Teacher: {DEFAULT_TOKENIZER} | dim={TEACHER_DIM} | device={teacher_device}")
 
 # extract hidden states for all training chunks (batched)
-TEACHER_BATCH = 128
+TEACHER_BATCH = 64
 teacher_hiddens = []
 for start in range(0, num_chunks, TEACHER_BATCH):
     end = min(start + TEACHER_BATCH, num_chunks)
