@@ -40,7 +40,7 @@ Tokenizer: Qwen3.5 (248K vocab, 201 languages)
 
 # %% — 0. Environment Setup
 # !pip install -q "jax[cuda12]" equinox jaxtyping optax einops tqdm
-# !pip install -q datasets tokenizers transformers==5.5.0 flash-linear-attention causal-conv1d
+# !pip install -q datasets tokenizers transformers==5.5.0
 
 import os
 import sys
@@ -60,7 +60,9 @@ if jax.default_backend() != "gpu":
 
 VELM_DIR = "/content/VELM" if os.path.exists("/content") else os.getcwd()
 if not os.path.exists(os.path.join(VELM_DIR, "src")):
-    os.system(f"git clone https://github.com/angrysky56/VELM.git {VELM_DIR} 2>/dev/null")
+    os.system(
+        f"git clone https://github.com/angrysky56/VELM.git {VELM_DIR} 2>/dev/null"
+    )
 if os.path.exists(os.path.join(VELM_DIR, "src")):
     os.chdir(VELM_DIR)
     sys.path.insert(0, VELM_DIR)
@@ -92,14 +94,33 @@ def detect_hardware() -> dict:
         dev = jax.devices("gpu")[0]
         kind = dev.device_kind.lower()
         if "h100" in kind or "a100" in kind:
-            return {"batch": 256, "ae_steps": 100_000, "egg_steps": 10_000,
-                    "pop": 64, "chunks": 500_000, "name": "A100/H100"}
+            return {
+                "batch": 256,
+                "ae_steps": 100_000,
+                "egg_steps": 10_000,
+                "pop": 64,
+                "chunks": 500_000,
+                "name": "A100/H100",
+            }
         else:  # T4, L4, RTX 3060, etc.
-            return {"batch": 64, "ae_steps": 150_000, "egg_steps": 5_000,
-                    "pop": 32, "chunks": 250_000, "name": "T4/consumer"}
+            return {
+                "batch": 64,
+                "ae_steps": 150_000,
+                "egg_steps": 5_000,
+                "pop": 32,
+                "chunks": 250_000,
+                "name": "T4/consumer",
+            }
     except Exception:  # pylint: disable=broad-except
-        return {"batch": 32, "ae_steps": 10_000, "egg_steps": 1_000,
-                "pop": 16, "chunks": 50_000, "name": "CPU (slow!)"}
+        return {
+            "batch": 32,
+            "ae_steps": 10_000,
+            "egg_steps": 1_000,
+            "pop": 16,
+            "chunks": 50_000,
+            "name": "CPU (slow!)",
+        }
+
 
 HW = detect_hardware()
 # gpu_12gb_v2: ae_hidden_dim=384 for 248K Qwen vocab (256 plateaus ~99.66%)
@@ -131,20 +152,38 @@ total_chunks = 0
 
 # Dataset sources with curriculum weights
 CURRICULUM = [
-    {"name": "open-web-math/open-web-math", "weight": 0.5, "label": "math",
-     "split": "train", "text_field": "text"},
-    {"name": "wikitext", "config": "wikitext-103-raw-v1", "weight": 0.3,
-     "label": "general", "split": "train", "text_field": "text"},
-    {"name": "roneneldan/TinyStories", "weight": 0.2, "label": "narrative",
-     "split": "train", "text_field": "text"},
+    {
+        "name": "open-web-math/open-web-math",
+        "weight": 0.5,
+        "label": "math",
+        "split": "train",
+        "text_field": "text",
+    },
+    {
+        "name": "wikitext",
+        "config": "wikitext-103-raw-v1",
+        "weight": 0.3,
+        "label": "general",
+        "split": "train",
+        "text_field": "text",
+    },
+    {
+        "name": "roneneldan/TinyStories",
+        "weight": 0.2,
+        "label": "narrative",
+        "split": "train",
+        "text_field": "text",
+    },
 ]
 
 for source in CURRICULUM:
     source_target = int(TARGET_CHUNKS * source["weight"])
     source_count = 0
     label = source["label"]
-    print(f"  Streaming {label}: {source['name']} "
-          f"(target: {source_target:,} chunks)...")
+    print(
+        f"  Streaming {label}: {source['name']} "
+        f"(target: {source_target:,} chunks)..."
+    )
     try:
         load_kwargs = {"split": source["split"], "streaming": True}
         if "config" in source:
@@ -196,7 +235,7 @@ for lab, cnt in sorted(label_counts.items()):
 HIDDEN_DIM = cfg.get("ae_hidden_dim", 256)
 LATENT_DIM = cfg["latent_dim"]  # now 128 (was 64 — too tight for 248K vocab)
 FFN_DIM = cfg.get("ae_ffn_intermediate", 512)
-KL_CLIP = cfg.get("ae_kl_clip", 0.5)    # paper uses λ_KL=0.5
+KL_CLIP = cfg.get("ae_kl_clip", 0.5)  # paper uses λ_KL=0.5
 KL_WEIGHT = cfg.get("ae_kl_weight", 0.001)  # paper uses β=0.001
 BATCH_SIZE = HW["batch"]
 AE_STEPS = HW["ae_steps"]
@@ -221,8 +260,11 @@ print(f"  hidden={HIDDEN_DIM}, latent={LATENT_DIM}, K={K}, vocab={VOCAB_SIZE:,}"
 
 effective_warmup = min(500, max(AE_STEPS // 10, 1))
 schedule = optax.warmup_cosine_decay_schedule(
-    init_value=0.0, peak_value=LR,
-    warmup_steps=effective_warmup, decay_steps=AE_STEPS, end_value=LR * 0.1,
+    init_value=0.0,
+    peak_value=LR,
+    warmup_steps=effective_warmup,
+    decay_steps=AE_STEPS,
+    end_value=LR * 0.1,
 )
 optimizer = optax.chain(
     optax.clip_by_global_norm(1.0),  # prevent gradient explosion → NaN
@@ -230,20 +272,27 @@ optimizer = optax.chain(
 )
 opt_state = optimizer.init(eqx.filter(model, eqx.is_array))
 
+
 @eqx.filter_jit
 def train_step(mdl, state, batch_chunk, key_step):
     """JIT-compiled AE training step."""
+
     def loss_fn(m):
         return batch_ae_loss(m, batch_chunk, key=key_step)
-    (loss_val, metrics_val), grads = eqx.filter_value_and_grad(loss_fn, has_aux=True)(mdl)
+
+    (loss_val, metrics_val), grads = eqx.filter_value_and_grad(loss_fn, has_aux=True)(
+        mdl
+    )
     updates, new_opt = optimizer.update(grads, state, mdl)
     new_model = eqx.apply_updates(mdl, updates)
     return new_model, new_opt, loss_val, metrics_val
+
 
 @eqx.filter_jit
 def eval_accuracy(mdl, batch_chunk):
     """Compute token-level reconstruction accuracy limit."""
     return reconstruction_accuracy(mdl, batch_chunk)
+
 
 # training loop
 print(f"\nPhase 1: AE training — {AE_STEPS:,} steps, batch={BATCH_SIZE}")
@@ -258,10 +307,12 @@ best_acc = 0.0
 if not os.path.exists("checkpoints/calm_ae_best.eqx"):
     try:
         from google.colab import drive  # noqa: E402
+
         drive.mount("/content/drive", force_remount=False)
         drive_dir = "/content/drive/MyDrive/VELM_checkpoints"
         if os.path.isdir(drive_dir):
             import shutil
+
             os.makedirs("checkpoints", exist_ok=True)
             for fname in os.listdir(drive_dir):
                 shutil.copy2(f"{drive_dir}/{fname}", f"checkpoints/{fname}")
@@ -270,13 +321,18 @@ if not os.path.exists("checkpoints/calm_ae_best.eqx"):
         pass  # Not on Colab or no Drive checkpoints
 
 SKIP_AE = False
-if os.path.exists("checkpoints/calm_ae_best.json") and os.path.exists("checkpoints/calm_ae_best.eqx"):
+if os.path.exists("checkpoints/calm_ae_best.json") and os.path.exists(
+    "checkpoints/calm_ae_best.eqx"
+):
     try:
         import json
+
         with open("checkpoints/calm_ae_best.json", "r", encoding="utf-8") as f:
             meta = json.load(f)
         if meta.get("accuracy", 0.0) >= 0.999:
-            print(f"\n✓ Found fully trained AE checkpoint! (accuracy: {meta['accuracy']:.4%})")
+            print(
+                f"\n✓ Found fully trained AE checkpoint! (accuracy: {meta['accuracy']:.4%})"
+            )
             print("  Skipping Phase 1 training.")
             model = eqx.tree_deserialise_leaves("checkpoints/calm_ae_best.eqx", model)
             SKIP_AE = True
@@ -301,8 +357,10 @@ for step in range(1, AE_STEPS + 1):
         history["loss"].append(float(loss))
         history["recon"].append(rl)
         history["kl"].append(kl)
-        print(f"  step {step:>6}/{AE_STEPS} | recon: {rl:.4f} | kl: {kl:.4f} | "
-              f"{step/elapsed:.1f} steps/s | {elapsed/60:.0f}m")
+        print(
+            f"  step {step:>6}/{AE_STEPS} | recon: {rl:.4f} | kl: {kl:.4f} | "
+            f"{step/elapsed:.1f} steps/s | {elapsed/60:.0f}m"
+        )
 
     if step % 2000 == 0:
         key, eval_key = jax.random.split(key)
@@ -316,10 +374,19 @@ for step in range(1, AE_STEPS + 1):
             os.makedirs("checkpoints", exist_ok=True)
             eqx.tree_serialise_leaves("checkpoints/calm_ae_best.eqx", model)
             import json
+
             with open("checkpoints/calm_ae_best.json", "w", encoding="utf-8") as f:
-                json.dump({"config": CONFIG_NAME, "vocab_size": VOCAB_SIZE,
-                           "tokenizer": DEFAULT_TOKENIZER, "step": step,
-                           "accuracy": acc}, f, indent=2)
+                json.dump(
+                    {
+                        "config": CONFIG_NAME,
+                        "vocab_size": VOCAB_SIZE,
+                        "tokenizer": DEFAULT_TOKENIZER,
+                        "step": step,
+                        "accuracy": acc,
+                    },
+                    f,
+                    indent=2,
+                )
             print(f"  >> Saved best checkpoint (acc={acc:.4%})")
         if acc > 0.999:
             print(f"  🎯 TARGET >99.9% at step {step}! — stopping early")
@@ -335,10 +402,12 @@ eqx.tree_serialise_leaves("checkpoints/calm_ae_final.eqx", model)
 # persist to Google Drive (Colab disk is ephemeral!)
 try:
     from google.colab import drive  # noqa: E402
+
     drive.mount("/content/drive", force_remount=False)
     drive_dir = "/content/drive/MyDrive/VELM_checkpoints"
     os.makedirs(drive_dir, exist_ok=True)
     import shutil
+
     for f in ["calm_ae_best.eqx", "calm_ae_best.json", "calm_ae_final.eqx"]:
         src = f"checkpoints/{f}"
         if os.path.exists(src):
@@ -354,11 +423,17 @@ matplotlib.use("Agg")  # headless
 import matplotlib.pyplot as plt
 
 fig, axes = plt.subplots(1, 3, figsize=(15, 4))
-axes[0].plot(history["recon"]); axes[0].set_title("Recon Loss"); axes[0].set_xlabel("×500 steps")
-axes[1].plot(history["kl"]); axes[1].set_title("KL Loss"); axes[1].set_xlabel("×500 steps")
+axes[0].plot(history["recon"])
+axes[0].set_title("Recon Loss")
+axes[0].set_xlabel("×500 steps")
+axes[1].plot(history["kl"])
+axes[1].set_title("KL Loss")
+axes[1].set_xlabel("×500 steps")
 axes[2].plot(history["accuracy"])
 axes[2].axhline(y=0.999, color="r", linestyle="--", label="99.9% target")
-axes[2].set_title("Reconstruction Acc"); axes[2].set_xlabel("×2000 steps"); axes[2].legend()
+axes[2].set_title("Reconstruction Acc")
+axes[2].set_xlabel("×2000 steps")
+axes[2].legend()
 plt.tight_layout()
 plt.savefig("ae_training_curves.png", dpi=150, bbox_inches="tight")
 print("Saved: ae_training_curves.png")
@@ -375,11 +450,13 @@ except Exception:  # pylint: disable=broad-except
 CONTINUE_AE = True  # set False to skip continuation
 CONTINUE_STEPS = 100_000
 CONTINUE_LR = 1e-4  # lower peak than Phase 1 (was 3e-4)
-TARGET_ACC = 0.999   # stop when we hit this
+TARGET_ACC = 0.999  # stop when we hit this
 
 if CONTINUE_AE and best_acc < TARGET_ACC:
     print(f"\nPhase 1.5: Continue AE training — best so far: {best_acc:.4%}")
-    print(f"  Loading best checkpoint, {CONTINUE_STEPS:,} more steps, peak LR={CONTINUE_LR}")
+    print(
+        f"  Loading best checkpoint, {CONTINUE_STEPS:,} more steps, peak LR={CONTINUE_LR}"
+    )
     print("=" * 60)
 
     # load best checkpoint
@@ -389,8 +466,10 @@ if CONTINUE_AE and best_acc < TARGET_ACC:
     # fresh optimizer with lower LR and longer warmup
     cont_warmup = min(1000, CONTINUE_STEPS // 10)
     cont_schedule = optax.warmup_cosine_decay_schedule(
-        init_value=0.0, peak_value=CONTINUE_LR,
-        warmup_steps=cont_warmup, decay_steps=CONTINUE_STEPS,
+        init_value=0.0,
+        peak_value=CONTINUE_LR,
+        warmup_steps=cont_warmup,
+        decay_steps=CONTINUE_STEPS,
         end_value=CONTINUE_LR * 0.01,  # decay to 1e-6
     )
     cont_optimizer = optax.chain(
@@ -404,8 +483,10 @@ if CONTINUE_AE and best_acc < TARGET_ACC:
     def cont_train_step(mdl, state, batch_chunk, key_step):
         def loss_fn(m):
             return batch_ae_loss(m, batch_chunk, key=key_step)
+
         (loss_val, metrics_val), grads = eqx.filter_value_and_grad(
-            loss_fn, has_aux=True)(mdl)
+            loss_fn, has_aux=True
+        )(mdl)
         updates, new_opt = cont_optimizer.update(grads, state, mdl)
         new_model = eqx.apply_updates(mdl, updates)
         return new_model, new_opt, loss_val, metrics_val
@@ -419,7 +500,8 @@ if CONTINUE_AE and best_acc < TARGET_ACC:
         indices = jax.random.randint(batch_key, (BATCH_SIZE,), 0, num_chunks)
         batch = jnp.array(all_chunks[indices])
         model, opt_state, loss, metrics = cont_train_step(
-            model, opt_state, batch, step_key)
+            model, opt_state, batch, step_key
+        )
 
         if step % 500 == 0:
             elapsed = time.time() - cont_start
@@ -427,9 +509,11 @@ if CONTINUE_AE and best_acc < TARGET_ACC:
             kl = float(metrics["kl_loss"])
             cont_history["recon"].append(rl)
             cont_history["kl"].append(kl)
-            print(f"  step {step:>6}/{CONTINUE_STEPS} | recon: {rl:.4f} | "
-                  f"kl: {kl:.4f} | {step/elapsed:.1f} steps/s | "
-                  f"{elapsed/60:.0f}m")
+            print(
+                f"  step {step:>6}/{CONTINUE_STEPS} | recon: {rl:.4f} | "
+                f"kl: {kl:.4f} | {step/elapsed:.1f} steps/s | "
+                f"{elapsed/60:.0f}m"
+            )
 
         if step % 2000 == 0:
             key, eval_key = jax.random.split(key)
@@ -442,12 +526,20 @@ if CONTINUE_AE and best_acc < TARGET_ACC:
                 best_acc = acc
                 eqx.tree_serialise_leaves("checkpoints/calm_ae_best.eqx", model)
                 import json
-                with open("checkpoints/calm_ae_best.json", "w",
-                          encoding="utf-8") as f:
-                    json.dump({"config": CONFIG_NAME, "vocab_size": VOCAB_SIZE,
-                               "tokenizer": DEFAULT_TOKENIZER,
-                               "step": 100_000 + step, "accuracy": acc,
-                               "phase": "1.5_continuation"}, f, indent=2)
+
+                with open("checkpoints/calm_ae_best.json", "w", encoding="utf-8") as f:
+                    json.dump(
+                        {
+                            "config": CONFIG_NAME,
+                            "vocab_size": VOCAB_SIZE,
+                            "tokenizer": DEFAULT_TOKENIZER,
+                            "step": 100_000 + step,
+                            "accuracy": acc,
+                            "phase": "1.5_continuation",
+                        },
+                        f,
+                        indent=2,
+                    )
                 print(f"  >> New best! Saved checkpoint (acc={acc:.4%})")
             if acc >= TARGET_ACC:
                 print(f"  🎯 TARGET {TARGET_ACC:.1%} reached at step {step}!")
@@ -489,15 +581,18 @@ EGG_LR = cfg.get("eggroll_lr", 3e-4)
 EVAL_BATCH = cfg.get("eggroll_eval_batch", 64)  # 64: balance speed vs stability
 ANTITHETIC = cfg.get("eggroll_antithetic", True)  # ±σ pairs: halves variance
 HC_D = cfg.get("hc_streams", 1)  # go-mHC residual streams
-HC_S = cfg.get("hc_s", 2)        # go-mHC expressivity
+HC_S = cfg.get("hc_s", 2)  # go-mHC expressivity
 
 key = jax.random.PRNGKey(123)
 k1, k2, key = jax.random.split(key, 3)
 
 backbone = VELMBackbone(
-    dim=cfg["hidden_dim"], num_heads=cfg["num_heads"],
-    num_miras_layers=cfg["miras_layers"], num_swa_layers=cfg["swa_layers"],
-    ffn_intermediate=cfg["ffn_intermediate"], chunk_size=K,
+    dim=cfg["hidden_dim"],
+    num_heads=cfg["num_heads"],
+    num_miras_layers=cfg["miras_layers"],
+    num_swa_layers=cfg["swa_layers"],
+    ffn_intermediate=cfg["ffn_intermediate"],
+    chunk_size=K,
     ae_hidden_dim=HIDDEN_DIM,
     hc_streams=HC_D,  # go-mHC d-axis scaling
     hc_s=HC_S,
@@ -505,8 +600,10 @@ backbone = VELMBackbone(
 )
 
 head = EnergyHead(
-    hidden_dim=cfg["hidden_dim"], latent_dim=LATENT_DIM,
-    num_blocks=cfg["energy_head_blocks"], key=k2,
+    hidden_dim=cfg["hidden_dim"],
+    latent_dim=LATENT_DIM,
+    num_blocks=cfg["energy_head_blocks"],
+    key=k2,
 )
 
 bb_p = sum(x.size for x in jax.tree.leaves(eqx.filter(backbone, eqx.is_array)))
@@ -514,17 +611,23 @@ hd_p = sum(x.size for x in jax.tree.leaves(eqx.filter(head, eqx.is_array)))
 print(f"Backbone: {bb_p:,} | Head: {hd_p:,} | Total: {bb_p+hd_p:,}")
 if HC_D > 1:
     print(f"go-mHC: d={HC_D} streams, s={HC_S} (doubly stochastic routing)")
-print(f"EGGROLL: pop={POP_SIZE}, σ={SIGMA}, steps={EGGROLL_STEPS:,}"
-      f"{', antithetic' if ANTITHETIC else ''}, eval_batch={EVAL_BATCH}")
+print(
+    f"EGGROLL: pop={POP_SIZE}, σ={SIGMA}, steps={EGGROLL_STEPS:,}"
+    f"{', antithetic' if ANTITHETIC else ''}, eval_batch={EVAL_BATCH}"
+)
 
 # Load frozen AE — from Phase 1 if it ran, otherwise from checkpoint
 if "model" not in dir() or model is None:
     print("Loading AE from checkpoint (Phase 1 was skipped)...")
     model = CALMAutoencoder(
-        vocab_size=VOCAB_SIZE, chunk_size=K,
-        hidden_dim=HIDDEN_DIM, latent_dim=LATENT_DIM,
-        ffn_intermediate=FFN_DIM, kl_weight=KL_WEIGHT,
-        kl_clip=KL_CLIP, key=jax.random.PRNGKey(42),
+        vocab_size=VOCAB_SIZE,
+        chunk_size=K,
+        hidden_dim=HIDDEN_DIM,
+        latent_dim=LATENT_DIM,
+        ffn_intermediate=FFN_DIM,
+        kl_weight=KL_WEIGHT,
+        kl_clip=KL_CLIP,
+        key=jax.random.PRNGKey(42),
     )
     ckpt_path = "checkpoints/calm_ae_best.eqx"
     if not os.path.exists(ckpt_path):
@@ -533,9 +636,11 @@ if "model" not in dir() or model is None:
     if not os.path.exists(ckpt_path):
         try:
             from google.colab import drive  # noqa: E402
+
             drive.mount("/content/drive", force_remount=False)
             drive_dir = "/content/drive/MyDrive/VELM_checkpoints"
             import shutil
+
             os.makedirs("checkpoints", exist_ok=True)
             for f in os.listdir(drive_dir):
                 shutil.copy2(f"{drive_dir}/{f}", f"checkpoints/{f}")
@@ -570,21 +675,27 @@ _loaded_teacher = False
 if os.path.exists(TEACHER_CACHE):
     all_teacher_vecs = np.load(TEACHER_CACHE)
     TEACHER_DIM = all_teacher_vecs.shape[1]
-    print(f"✓ Loaded cached teacher vectors: {all_teacher_vecs.shape} from {TEACHER_CACHE}")
+    print(
+        f"✓ Loaded cached teacher vectors: {all_teacher_vecs.shape} from {TEACHER_CACHE}"
+    )
     _loaded_teacher = True
 else:
     # try Google Drive
     try:
         from google.colab import drive  # noqa: E402
+
         drive.mount("/content/drive", force_remount=False)
         drive_path = "/content/drive/MyDrive/VELM_checkpoints/teacher_vectors.npy"
         if os.path.exists(drive_path):
             import shutil
+
             os.makedirs("checkpoints", exist_ok=True)
             shutil.copy2(drive_path, TEACHER_CACHE)
             all_teacher_vecs = np.load(TEACHER_CACHE)
             TEACHER_DIM = all_teacher_vecs.shape[1]
-            print(f"✓ Restored teacher vectors from Google Drive: {all_teacher_vecs.shape}")
+            print(
+                f"✓ Restored teacher vectors from Google Drive: {all_teacher_vecs.shape}"
+            )
             _loaded_teacher = True
     except (ImportError, FileNotFoundError):
         pass
@@ -592,25 +703,32 @@ else:
 if not _loaded_teacher:
     import torch
     from transformers import AutoModelForCausalLM
+
     print("\nExtracting teacher vectors from Qwen3.5-0.8B...")
     teacher_device = "cuda" if torch.cuda.is_available() else "cpu"
-    teacher_model = AutoModelForCausalLM.from_pretrained(
-        DEFAULT_TOKENIZER, trust_remote_code=True,
-        torch_dtype=torch.float16 if teacher_device == "cuda" else torch.float32,
-    ).to(teacher_device).eval()
+    teacher_model = (
+        AutoModelForCausalLM.from_pretrained(
+            DEFAULT_TOKENIZER,
+            trust_remote_code=True,
+            torch_dtype=torch.float16 if teacher_device == "cuda" else torch.float32,
+        )
+        .to(teacher_device)
+        .eval()
+    )
     TEACHER_DIM = teacher_model.config.hidden_size
-    print(f"  Teacher: {DEFAULT_TOKENIZER} | dim={TEACHER_DIM} | device={teacher_device}")
+    print(
+        f"  Teacher: {DEFAULT_TOKENIZER} | dim={TEACHER_DIM} | device={teacher_device}"
+    )
     TEACHER_BATCH = 64
     teacher_hiddens = []
-    for start in tqdm(range(0, num_chunks, TEACHER_BATCH),
-                      desc="  Extracting"):
+    for start in tqdm(range(0, num_chunks, TEACHER_BATCH), desc="  Extracting"):
         end = min(start + TEACHER_BATCH, num_chunks)
         batch_ids = all_chunks[start:end]
         with torch.no_grad():
             input_ids = torch.tensor(
-                np.array(batch_ids), dtype=torch.long, device=teacher_device)
-            outputs = teacher_model(
-                input_ids=input_ids, output_hidden_states=True)
+                np.array(batch_ids), dtype=torch.long, device=teacher_device
+            )
+            outputs = teacher_model(input_ids=input_ids, output_hidden_states=True)
             last_hidden = outputs.hidden_states[-1].float().mean(dim=1)
             teacher_hiddens.append(last_hidden.cpu().numpy())
     all_teacher_vecs = np.concatenate(teacher_hiddens, axis=0)
@@ -618,7 +736,8 @@ if not _loaded_teacher:
     if nan_count > 0:
         print(f"  ⚠ {nan_count} non-finite values — replacing with 0")
         all_teacher_vecs = np.nan_to_num(
-            all_teacher_vecs, nan=0.0, posinf=0.0, neginf=0.0)
+            all_teacher_vecs, nan=0.0, posinf=0.0, neginf=0.0
+        )
     teacher_std = np.std(all_teacher_vecs)
     if teacher_std > 0:
         all_teacher_vecs = all_teacher_vecs / teacher_std
@@ -628,10 +747,12 @@ if not _loaded_teacher:
     np.save(TEACHER_CACHE, all_teacher_vecs)
     try:
         from google.colab import drive
+
         drive.mount("/content/drive", force_remount=False)
         drive_dir = "/content/drive/MyDrive/VELM_checkpoints"
         os.makedirs(drive_dir, exist_ok=True)
         import shutil
+
         shutil.copy2(TEACHER_CACHE, f"{drive_dir}/teacher_vectors.npy")
         print(f"  ✓ Saved to Drive: {drive_dir}/teacher_vectors.npy")
     except ImportError:
@@ -654,6 +775,7 @@ _hd_static = eqx.filter(head, lambda x: not eqx.is_array(x))
 
 # create teacher projection: teacher_dim → backbone_dim
 from src.training.distillation import TeacherProjection  # noqa: E402
+
 k_proj, key = jax.random.split(key)
 teacher_proj = TeacherProjection(TEACHER_DIM, cfg["hidden_dim"], key=k_proj)
 
@@ -679,8 +801,11 @@ if USE_GRADIENT_PHASE:
     print("=" * 60)
 
     grad_schedule = optax.warmup_cosine_decay_schedule(
-        init_value=0.0, peak_value=GRAD_LR,
-        warmup_steps=500, decay_steps=GRAD_STEPS, end_value=GRAD_LR * 0.01,
+        init_value=0.0,
+        peak_value=GRAD_LR,
+        warmup_steps=500,
+        decay_steps=GRAD_STEPS,
+        end_value=GRAD_LR * 0.01,
     )
     grad_optimizer = optax.chain(
         optax.clip_by_global_norm(1.0),
@@ -691,25 +816,31 @@ if USE_GRADIENT_PHASE:
     @eqx.filter_jit
     def grad_train_step(params, opt_st, batch_tokens, batch_teacher, step_key):
         """Gradient training: energy loss + teacher distillation."""
+
         def loss_fn(p):
             bb = eqx.combine(p["backbone"], _bb_static)
             hd = eqx.combine(p["head"], _hd_static)
             tp = eqx.combine(p["teacher_proj"], _tp_static)
             # encode chunks → target latents via frozen AE
-            tgt_z = jax.vmap(
-                lambda c: frozen_ae.encode(c, training=False)[0])(batch_tokens)
+            tgt_z = jax.vmap(lambda c: frozen_ae.encode(c, training=False)[0])(
+                batch_tokens
+            )
+
             # compress input for backbone
             def compress(chunk):
                 embs = jax.vmap(frozen_ae.embedding)(chunk)
                 return bb.compress_input(embs)
+
             inp_seq = jax.vmap(compress)(batch_tokens)
             # backbone forward
             hid, _ = bb(inp_seq)
             # energy loss: predict z_{i+1} from h_i
             hid_in, z_target = hid[:-1], tgt_z[1:]
+
             def pos_loss(h, z_t, k):
                 samples = hd(h, key=k, num_samples=8)
                 return energy_score(samples, z_t)
+
             keys = jax.random.split(step_key, hid_in.shape[0])
             e_losses = jax.vmap(pos_loss)(hid_in, z_target, keys)
             e_loss = jnp.mean(e_losses)
@@ -722,10 +853,13 @@ if USE_GRADIENT_PHASE:
             d_loss = jnp.where(jnp.isfinite(d_loss), d_loss, 0.0)
             e_loss = jnp.where(jnp.isfinite(e_loss), e_loss, 100.0)
             return e_loss + 0.5 * d_loss, {
-                "energy_loss": e_loss, "distill_loss": d_loss}
+                "energy_loss": e_loss,
+                "distill_loss": d_loss,
+            }
 
-        (loss_val, metrics), grads = eqx.filter_value_and_grad(
-            loss_fn, has_aux=True)(params)
+        (loss_val, metrics), grads = eqx.filter_value_and_grad(loss_fn, has_aux=True)(
+            params
+        )
         updates, new_opt = grad_optimizer.update(grads, opt_st, params)
         new_params = optax.apply_updates(params, updates)
         return new_params, new_opt, loss_val, metrics
@@ -736,10 +870,13 @@ if USE_GRADIENT_PHASE:
     _w_teacher = jnp.array(all_teacher_vecs[:GRAD_BATCH])
     _w_key = jax.random.PRNGKey(0)
     _, _, _w_loss, _w_metrics = grad_train_step(
-        trainable, grad_opt_state, _w_batch, _w_teacher, _w_key)
+        trainable, grad_opt_state, _w_batch, _w_teacher, _w_key
+    )
     _w_loss.block_until_ready()
-    print(f"✓ Compiled | initial energy: {float(_w_metrics['energy_loss']):.4f}"
-          f" | distill: {float(_w_metrics['distill_loss']):.4f}\n")
+    print(
+        f"✓ Compiled | initial energy: {float(_w_metrics['energy_loss']):.4f}"
+        f" | distill: {float(_w_metrics['distill_loss']):.4f}\n"
+    )
 
     grad_history = {"energy_loss": []}
     grad_start = time.time()
@@ -751,7 +888,8 @@ if USE_GRADIENT_PHASE:
         batch = jnp.array(all_chunks[idx])
         batch_teacher = jnp.array(all_teacher_vecs[idx])
         trainable, grad_opt_state, loss, metrics = grad_train_step(
-            trainable, grad_opt_state, batch, batch_teacher, step_key)
+            trainable, grad_opt_state, batch, batch_teacher, step_key
+        )
 
         if step % 200 == 0:
             el = float(metrics["energy_loss"])
@@ -763,23 +901,25 @@ if USE_GRADIENT_PHASE:
             if tl < best_grad_loss:
                 best_grad_loss = tl
                 marker = " ★"
-            print(f"  step {step:>5}/{GRAD_STEPS} | energy: {el:.4f} | "
-                  f"distill: {dl:.4f} | total: {tl:.4f}{marker} | "
-                  f"{step/elapsed:.1f} steps/s | {elapsed/60:.0f}m")
+            print(
+                f"  step {step:>5}/{GRAD_STEPS} | energy: {el:.4f} | "
+                f"distill: {dl:.4f} | total: {tl:.4f}{marker} | "
+                f"{step/elapsed:.1f} steps/s | {elapsed/60:.0f}m"
+            )
 
         if step % 2000 == 0:
             os.makedirs("checkpoints", exist_ok=True)
             ckpt_bb = eqx.combine(trainable["backbone"], _bb_static)
             ckpt_hd = eqx.combine(trainable["head"], _hd_static)
-            eqx.tree_serialise_leaves(
-                "checkpoints/backbone_grad.eqx", ckpt_bb)
-            eqx.tree_serialise_leaves(
-                "checkpoints/energy_head_grad.eqx", ckpt_hd)
+            eqx.tree_serialise_leaves("checkpoints/backbone_grad.eqx", ckpt_bb)
+            eqx.tree_serialise_leaves("checkpoints/energy_head_grad.eqx", ckpt_hd)
             print(f"  >> Checkpoint saved (energy={best_grad_loss:.4f})")
 
     grad_elapsed = time.time() - grad_start
-    print(f"\nPhase 2a done: {grad_elapsed/3600:.2f}h | "
-          f"best energy loss: {best_grad_loss:.4f}")
+    print(
+        f"\nPhase 2a done: {grad_elapsed/3600:.2f}h | "
+        f"best energy loss: {best_grad_loss:.4f}"
+    )
 
     # save final gradient-trained models
     final_bb = eqx.combine(trainable["backbone"], _bb_static)
@@ -791,10 +931,12 @@ if USE_GRADIENT_PHASE:
     # persist to Google Drive
     try:
         from google.colab import drive
+
         drive.mount("/content/drive", force_remount=False)
         drive_dir = "/content/drive/MyDrive/VELM_checkpoints"
         os.makedirs(drive_dir, exist_ok=True)
         import shutil
+
         for f in ["backbone_grad.eqx", "energy_head_grad.eqx"]:
             shutil.copy2(f"checkpoints/{f}", f"{drive_dir}/{f}")
         print(f"✓ Backbone + head backed up to Drive")
@@ -806,8 +948,6 @@ if USE_GRADIENT_PHASE:
 # EGGROLL is preserved for future nonlinear recurrence where backprop is
 # impractical (true BPTT over long sequences with nonlinear Miras memory).
 USE_EGGROLL_PHASE = False  # EGGROLL for GEA only — distillation is primary
-
-
 
 
 @eqx.filter_jit
@@ -828,6 +968,7 @@ def evaluate_member(base_params, member_key, batch):
     def compress(chunk):
         embs = jax.vmap(frozen_ae.embedding)(chunk)
         return bb.compress_input(embs)
+
     inp_seq = jax.vmap(compress)(batch)
 
     # backbone forward → hidden states
@@ -835,9 +976,13 @@ def evaluate_member(base_params, member_key, batch):
 
     # energy loss: predict z_{i+1} from h_i
     hid_in, z_target = hid[:-1], tgt_z[1:]
+
     def pos_loss(h, z_t):
-        samples = hd(h, key=jax.random.PRNGKey(0), num_samples=8)  # paper recommends N=8
+        samples = hd(
+            h, key=jax.random.PRNGKey(0), num_samples=8
+        )  # paper recommends N=8
         return energy_score(samples, z_t)
+
     loss_vals = jax.vmap(pos_loss)(hid_in, z_target)
     fitness = -jnp.mean(loss_vals)
     return jnp.where(jnp.isfinite(fitness), fitness, -1e6), perturbation
@@ -852,15 +997,19 @@ def evaluate_params(params, batch):
     bb = eqx.combine(params["backbone"], _bb_static)
     hd = eqx.combine(params["head"], _hd_static)
     tgt_z = jax.vmap(lambda c: frozen_ae.encode(c, training=False)[0])(batch)
+
     def compress(chunk):
         embs = jax.vmap(frozen_ae.embedding)(chunk)
         return bb.compress_input(embs)
+
     inp_seq = jax.vmap(compress)(batch)
     hid, _ = bb(inp_seq)
     hid_in, z_target = hid[:-1], tgt_z[1:]
+
     def pos_loss(h, z_t):
         samples = hd(h, key=jax.random.PRNGKey(0), num_samples=8)
         return energy_score(samples, z_t)
+
     loss_vals = jax.vmap(pos_loss)(hid_in, z_target)
     fitness = -jnp.mean(loss_vals)
     return jnp.where(jnp.isfinite(fitness), fitness, -1e6)
@@ -879,8 +1028,10 @@ _warmup_f.block_until_ready()  # force compilation to finish
 _warmup_f2 = evaluate_params(trainable, _warmup_batch)
 _warmup_f2.block_until_ready()
 del _warmup_f, _warmup_p, _warmup_f2
-print(f"✓ Compilation done in {time.time() - compile_start:.0f}s — "
-      "training loop will be fast\n")
+print(
+    f"✓ Compilation done in {time.time() - compile_start:.0f}s — "
+    "training loop will be fast\n"
+)
 
 # EGGROLL training loop
 if not USE_EGGROLL_PHASE:
@@ -891,8 +1042,8 @@ else:
     # Progressive EGGROLL: train head first, then unfreeze backbone.
     # pop=32 on 7.2M params has ~1% SNR (noise). But pop=32 on 819K
     # head params has ~7% SNR — enough to learn.
-    HEAD_STEPS = 1500   # Phase i: head only (819K params, faster convergence)
-    FULL_STEPS = 2000   # Phase ii: head + backbone (7.2M params)
+    HEAD_STEPS = 1500  # Phase i: head only (819K params, faster convergence)
+    FULL_STEPS = 2000  # Phase ii: head + backbone (7.2M params)
     EGGROLL_STEPS = HEAD_STEPS + FULL_STEPS
 
     print(f"Phase 2b: Progressive EGGROLL — {EGGROLL_STEPS:,} total steps")
@@ -907,12 +1058,12 @@ best_egg_fitness = -float("inf")
 
 # separate trainable sets for progressive unfreezing
 head_trainable = {"head": trainable["head"]}
-head_opt = optax.chain(
-    optax.clip_by_global_norm(1.0), optax.adam(EGG_LR))
+head_opt = optax.chain(optax.clip_by_global_norm(1.0), optax.adam(EGG_LR))
 head_opt_state = head_opt.init(head_trainable)
 
 full_opt = optax.chain(
-    optax.clip_by_global_norm(1.0), optax.adam(EGG_LR * 0.3))  # lower lr for full
+    optax.clip_by_global_norm(1.0), optax.adam(EGG_LR * 0.3)
+)  # lower lr for full
 full_opt_state = full_opt.init(trainable)
 
 for step in range(1, (EGGROLL_STEPS + 1) if USE_EGGROLL_PHASE else 0):
@@ -948,17 +1099,21 @@ for step in range(1, (EGGROLL_STEPS + 1) if USE_EGGROLL_PHASE else 0):
 
         if training_head_only:
             # perturb head only, backbone stays frozen
-            pos_full = {"backbone": trainable["backbone"],
-                        "head": jax.tree.map(lambda p, e: p + SIGMA * e,
-                                             active_params["head"], pert["head"])}
-            neg_full = {"backbone": trainable["backbone"],
-                        "head": jax.tree.map(lambda p, e: p - SIGMA * e,
-                                             active_params["head"], pert["head"])}
+            pos_full = {
+                "backbone": trainable["backbone"],
+                "head": jax.tree.map(
+                    lambda p, e: p + SIGMA * e, active_params["head"], pert["head"]
+                ),
+            }
+            neg_full = {
+                "backbone": trainable["backbone"],
+                "head": jax.tree.map(
+                    lambda p, e: p - SIGMA * e, active_params["head"], pert["head"]
+                ),
+            }
         else:
-            pos_full = jax.tree.map(
-                lambda p, e: p + SIGMA * e, active_params, pert)
-            neg_full = jax.tree.map(
-                lambda p, e: p - SIGMA * e, active_params, pert)
+            pos_full = jax.tree.map(lambda p, e: p + SIGMA * e, active_params, pert)
+            neg_full = jax.tree.map(lambda p, e: p - SIGMA * e, active_params, pert)
 
         f_pos = evaluate_params(pos_full, batch)
         f_neg = evaluate_params(neg_full, batch)
@@ -978,34 +1133,33 @@ for step in range(1, (EGGROLL_STEPS + 1) if USE_EGGROLL_PHASE else 0):
         w = diffs_arr.reshape((-1,) + (1,) * (stacked.ndim - 1))
         es_grad_leaves.append(jnp.sum(stacked * w, axis=0))
     es_grad = jax.tree.unflatten(treedef, es_grad_leaves)
-    neg_grad = jax.tree.map(
-        lambda g: g * (-1.0 / (2.0 * SIGMA * POP_SIZE)), es_grad)
+    neg_grad = jax.tree.map(lambda g: g * (-1.0 / (2.0 * SIGMA * POP_SIZE)), es_grad)
 
     # Adam update on the active param set
     if training_head_only:
         updates, head_opt_state = head_opt.update(
-            neg_grad, head_opt_state, head_trainable)
+            neg_grad, head_opt_state, head_trainable
+        )
         head_trainable = optax.apply_updates(head_trainable, updates)
     else:
-        updates, full_opt_state = full_opt.update(
-            neg_grad, full_opt_state, trainable)
+        updates, full_opt_state = full_opt.update(neg_grad, full_opt_state, trainable)
         trainable = optax.apply_updates(trainable, updates)
 
     # logging every 100 steps
     if step % 100 == 0:
         mf = float(jnp.mean(fitnesses_arr))
         xf = float(jnp.max(fitnesses_arr))
-        gn = float(jnp.sqrt(sum(
-            jnp.sum(leaf**2) for leaf in jax.tree.leaves(es_grad)
-        )))
+        gn = float(jnp.sqrt(sum(jnp.sum(leaf**2) for leaf in jax.tree.leaves(es_grad))))
         egg_history["mean_fitness"].append(mf)
         egg_history["max_fitness"].append(xf)
         egg_history["grad_norm"].append(gn)
         egg_history["phase"].append(phase_label)
         elapsed = time.time() - start
-        print(f"  step {step:>5}/{EGGROLL_STEPS} [{phase_label:>4}] | "
-              f"mean_f: {mf:.4f} | max_f: {xf:.4f} | "
-              f"grad: {gn:.4f} | {elapsed/60:.0f}m")
+        print(
+            f"  step {step:>5}/{EGGROLL_STEPS} [{phase_label:>4}] | "
+            f"mean_f: {mf:.4f} | max_f: {xf:.4f} | "
+            f"grad: {gn:.4f} | {elapsed/60:.0f}m"
+        )
 
         # divergence detection — fitness should improve (get less negative)
         if len(egg_history["mean_fitness"]) >= 5:
@@ -1022,8 +1176,10 @@ for step in range(1, (EGGROLL_STEPS + 1) if USE_EGGROLL_PHASE else 0):
         os.makedirs("checkpoints", exist_ok=True)
         # sync head into trainable if still in head-only phase
         if training_head_only:
-            save_params = {"backbone": trainable["backbone"],
-                           "head": head_trainable["head"]}
+            save_params = {
+                "backbone": trainable["backbone"],
+                "head": head_trainable["head"],
+            }
         else:
             save_params = trainable
         ckpt_bb = eqx.combine(save_params["backbone"], _bb_static)
@@ -1041,8 +1197,7 @@ print(f"\nPhase 2 done: {elapsed/3600:.2f}h")
 
 # sync final head params if still in head-only phase
 if USE_EGGROLL_PHASE and "head" in head_trainable:
-    trainable = {"backbone": trainable["backbone"],
-                 "head": head_trainable["head"]}
+    trainable = {"backbone": trainable["backbone"], "head": head_trainable["head"]}
 
 # save final
 final_bb = eqx.combine(trainable["backbone"], _bb_static)
@@ -1054,20 +1209,33 @@ eqx.tree_serialise_leaves("checkpoints/energy_head_eggroll.eqx", final_hd)
 import json  # noqa: E402
 
 with open("checkpoints/backbone_meta.json", "w", encoding="utf-8") as f:
-    json.dump({"config": CONFIG_NAME, "vocab_size": VOCAB_SIZE,
-               "tokenizer": DEFAULT_TOKENIZER,
-               "eggroll_steps": EGGROLL_STEPS, "pop_size": POP_SIZE,
-               "sigma": SIGMA, "history": egg_history}, f, indent=2)
+    json.dump(
+        {
+            "config": CONFIG_NAME,
+            "vocab_size": VOCAB_SIZE,
+            "tokenizer": DEFAULT_TOKENIZER,
+            "eggroll_steps": EGGROLL_STEPS,
+            "pop_size": POP_SIZE,
+            "sigma": SIGMA,
+            "history": egg_history,
+        },
+        f,
+        indent=2,
+    )
 print("✓ Saved: checkpoints/backbone_eggroll.eqx + energy_head_eggroll.eqx")
 
 # %% — 8. Plot EGGROLL training curves
 fig, axes = plt.subplots(1, 3, figsize=(15, 4))
 axes[0].plot(egg_history["mean_fitness"], label="mean")
 axes[0].plot(egg_history["max_fitness"], label="max")
-axes[0].set_title("EGGROLL Fitness"); axes[0].legend(); axes[0].set_xlabel("×100 steps")
-axes[1].plot(egg_history["grad_norm"]); axes[1].set_title("ES Grad Norm")
+axes[0].set_title("EGGROLL Fitness")
+axes[0].legend()
+axes[0].set_xlabel("×100 steps")
+axes[1].plot(egg_history["grad_norm"])
+axes[1].set_title("ES Grad Norm")
 axes[2].plot([-f for f in egg_history["mean_fitness"]])
-axes[2].set_title("Energy Loss (↓ better)"); axes[2].set_xlabel("×100 steps")
+axes[2].set_title("Energy Loss (↓ better)")
+axes[2].set_xlabel("×100 steps")
 plt.tight_layout()
 plt.savefig("eggroll_training.png", dpi=150, bbox_inches="tight")
 print("Saved: eggroll_training.png")
@@ -1106,23 +1274,22 @@ from src.evolution.gea_eggroll import (  # noqa: E402
 )
 
 # --- GEA configuration (hw-adaptive) ---
-GEA_ITERATIONS = 10         # quality over speed
+GEA_ITERATIONS = 10  # quality over speed
 GEA_POP = min(HW["pop"], 32)  # population per GEA generation
-GEA_GROUP = 5                # parent group size (K in GEA paper)
-GEA_SIGMA = SIGMA             # use same σ as EGGROLL Phase 2
-GEA_BIAS = 0.3               # parent-direction bias strength
+GEA_GROUP = 5  # parent group size (K in GEA paper)
+GEA_SIGMA = SIGMA  # use same σ as EGGROLL Phase 2
+GEA_BIAS = 0.3  # parent-direction bias strength
 
 print(f"\nPhase 3: GEA Group Evolution — {GEA_ITERATIONS} iterations")
 print(f"  population: {GEA_POP} | group: {GEA_GROUP} | σ: {GEA_SIGMA}")
 print("=" * 60)
 
 # Build task distribution from actual data domains (set in Section 4)
-unique_labels = sorted(set(
-    lab for lab in chunk_labels if not lab.endswith("_fallback")
-))
+unique_labels = sorted(
+    set(lab for lab in chunk_labels if not lab.endswith("_fallback"))
+)
 task_distribution = (
-    [{"type": lab} for lab in unique_labels]
-    if unique_labels else [{"type": "default"}]
+    [{"type": lab} for lab in unique_labels] if unique_labels else [{"type": "default"}]
 )
 print(f"  Task domains: {[t['type'] for t in task_distribution]}")
 
@@ -1130,6 +1297,7 @@ print(f"  Task domains: {[t['type'] for t in task_distribution]}")
 domain_indices: dict[str, list[int]] = {}
 for i, lab in enumerate(chunk_labels):
     domain_indices.setdefault(lab, []).append(i)
+
 
 def gea_fitness_fn(params, task):
     """Evaluate fitness on a specific task domain.
@@ -1163,6 +1331,7 @@ def gea_fitness_fn(params, task):
     def compress(chunk):
         embs = jax.vmap(frozen_ae.embedding)(chunk)
         return bb.compress_input(embs)
+
     inp_seq = jax.vmap(compress)(batch_tokens)
 
     # backbone forward
@@ -1172,7 +1341,9 @@ def gea_fitness_fn(params, task):
     hid_in, z_target = hid[:-1], tgt_z[1:]
 
     def pos_loss(h, z_t):
-        samples = hd(h, key=jax.random.PRNGKey(0), num_samples=8)  # paper recommends N=8
+        samples = hd(
+            h, key=jax.random.PRNGKey(0), num_samples=8
+        )  # paper recommends N=8
         return energy_score(samples, z_t)
 
     loss_vals = jax.vmap(pos_loss)(hid_in, z_target)
@@ -1202,8 +1373,12 @@ for gea_iter in range(1, GEA_ITERATIONS + 1):
 
     # GEA evaluate + select
     experience, traces = evolver.evolution_step(
-        trainable, gea_fitness_fn, task_distribution,
-        key=iter_key, sigma=GEA_SIGMA, rank=1,
+        trainable,
+        gea_fitness_fn,
+        task_distribution,
+        key=iter_key,
+        sigma=GEA_SIGMA,
+        rank=1,
     )
 
     # extract unique parent indices
@@ -1217,9 +1392,13 @@ for gea_iter in range(1, GEA_ITERATIONS + 1):
 
     # experience-biased EGGROLL update
     trainable, gea_opt_state, step_metrics = experience_weighted_eggroll_step(
-        trainable, traces, key=eggroll_key,
-        optimizer=gea_optimizer, opt_state=gea_opt_state,
-        sigma=GEA_SIGMA, rank=1,
+        trainable,
+        traces,
+        key=eggroll_key,
+        optimizer=gea_optimizer,
+        opt_state=gea_opt_state,
+        sigma=GEA_SIGMA,
+        rank=1,
         parent_indices=unique_parents if unique_parents else None,
         parent_bias=GEA_BIAS,
     )
@@ -1231,9 +1410,11 @@ for gea_iter in range(1, GEA_ITERATIONS + 1):
     gea_history["parent_sizes"].append(len(unique_parents))
 
     elapsed = time.time() - gea_start
-    print(f"  GEA {gea_iter:>3}/{GEA_ITERATIONS} | "
-          f"mean: {mf:.4f} | best: {xf:.4f} | "
-          f"parents: {len(unique_parents)} | {elapsed/60:.0f}m")
+    print(
+        f"  GEA {gea_iter:>3}/{GEA_ITERATIONS} | "
+        f"mean: {mf:.4f} | best: {xf:.4f} | "
+        f"parents: {len(unique_parents)} | {elapsed/60:.0f}m"
+    )
 
 gea_elapsed = time.time() - gea_start
 print(f"\nPhase 3 done: {gea_elapsed/60:.1f}m")
@@ -1251,10 +1432,12 @@ fig, axes = plt.subplots(1, 2, figsize=(12, 4))
 axes[0].plot(gea_history["mean_fitness"], label="mean", marker="o")
 axes[0].plot(gea_history["max_fitness"], label="best", marker="s")
 axes[0].set_title("GEA Fitness Over Iterations")
-axes[0].set_xlabel("GEA Iteration"); axes[0].legend()
+axes[0].set_xlabel("GEA Iteration")
+axes[0].legend()
 axes[1].bar(range(len(gea_history["parent_sizes"])), gea_history["parent_sizes"])
 axes[1].set_title("Unique Parents Per Iteration")
-axes[1].set_xlabel("GEA Iteration"); axes[1].set_ylabel("# Parents")
+axes[1].set_xlabel("GEA Iteration")
+axes[1].set_ylabel("# Parents")
 plt.tight_layout()
 plt.savefig("gea_evolution.png", dpi=150, bbox_inches="tight")
 print("Saved: gea_evolution.png")
@@ -1291,15 +1474,18 @@ key, pred_key = jax.random.split(key)
 test_idx = jax.random.randint(pred_key, (100,), 0, num_chunks)
 test_tokens = jnp.array(all_chunks[test_idx])
 target_z = jax.vmap(lambda c: frozen_ae.encode(c, training=False)[0])(test_tokens)
-input_seq = jax.vmap(lambda c: final_bb.compress_input(
-    jax.vmap(frozen_ae.embedding)(c)))(test_tokens)
+input_seq = jax.vmap(
+    lambda c: final_bb.compress_input(jax.vmap(frozen_ae.embedding)(c))
+)(test_tokens)
 hidden, _ = final_bb(input_seq)
 h_in, z_tgt = hidden[:-1], target_z[1:]
+
 
 def measure_loss(h, z_t, k):
     """Measure energy loss by sampling and scoring."""
     samples = final_hd(h, key=k, num_samples=8)
     return energy_score(samples, z_t)
+
 
 pred_keys = jax.random.split(pred_key, h_in.shape[0])
 losses = jax.vmap(measure_loss)(h_in, z_tgt, pred_keys)
@@ -1331,13 +1517,20 @@ print("  gea_evolution.png")
 # Colab download helper
 try:
     from google.colab import files  # noqa: E402
-    for f in ["checkpoints/calm_ae_best.eqx", "checkpoints/calm_ae_best.json",
-              "checkpoints/backbone_eggroll.eqx", "checkpoints/energy_head_eggroll.eqx",
-              "checkpoints/backbone_gea.eqx", "checkpoints/energy_head_gea.eqx",
-              "checkpoints/backbone_meta.json",
-              "ae_training_curves.png", "eggroll_training.png", "gea_evolution.png"]:
+
+    for f in [
+        "checkpoints/calm_ae_best.eqx",
+        "checkpoints/calm_ae_best.json",
+        "checkpoints/backbone_eggroll.eqx",
+        "checkpoints/energy_head_eggroll.eqx",
+        "checkpoints/backbone_gea.eqx",
+        "checkpoints/energy_head_gea.eqx",
+        "checkpoints/backbone_meta.json",
+        "ae_training_curves.png",
+        "eggroll_training.png",
+        "gea_evolution.png",
+    ]:
         if os.path.exists(f):
             files.download(f)
 except ImportError:
     print("\nNot on Colab — checkpoints are in ./checkpoints/")
-
