@@ -580,15 +580,6 @@ if torch.cuda.is_available():
     torch.cuda.empty_cache()
 print("  ✓ Teacher model unloaded, GPU memory freed")
 
-# create teacher projection: teacher_dim → backbone_dim
-from src.training.distillation import TeacherProjection  # noqa: E402
-k_proj, key = jax.random.split(key)
-teacher_proj = TeacherProjection(TEACHER_DIM, cfg["hidden_dim"], key=k_proj)
-
-# add projection to trainable params
-trainable["teacher_proj"] = eqx.filter(teacher_proj, eqx.is_array)
-_tp_static = eqx.filter(teacher_proj, lambda x: not eqx.is_array(x))
-
 # pack trainable params
 trainable = {
     "backbone": eqx.filter(backbone, eqx.is_array),
@@ -598,6 +589,15 @@ trainable = {
 # Extract static (non-array) module parts ONCE — used by evaluate_member and GEA
 _bb_static = eqx.filter(backbone, lambda x: not eqx.is_array(x))
 _hd_static = eqx.filter(head, lambda x: not eqx.is_array(x))
+
+# create teacher projection: teacher_dim → backbone_dim
+from src.training.distillation import TeacherProjection  # noqa: E402
+k_proj, key = jax.random.split(key)
+teacher_proj = TeacherProjection(TEACHER_DIM, cfg["hidden_dim"], key=k_proj)
+
+# add projection to trainable params (after dict is created)
+trainable["teacher_proj"] = eqx.filter(teacher_proj, eqx.is_array)
+_tp_static = eqx.filter(teacher_proj, lambda x: not eqx.is_array(x))
 
 # %% — 7a. Phase 2a: Gradient-based backbone training
 # The current forward pass is fully differentiable through JAX.
