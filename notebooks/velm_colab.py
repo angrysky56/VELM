@@ -20,7 +20,7 @@ Tokenizer: Qwen3.5 (248K vocab, 201 languages)
 
 # %% — 0. Environment Setup
 # !pip install -q "jax[cuda12]" equinox jaxtyping optax einops tqdm
-# !pip install -q datasets tokenizers transformers==5.5.0 flash-linear-attention
+# !pip install -q datasets tokenizers transformers==5.5.0 flash-linear-attention causal-conv1d
 
 import os
 import sys
@@ -559,7 +559,7 @@ print(f"  Teacher: {DEFAULT_TOKENIZER} | dim={TEACHER_DIM} | device={teacher_dev
 # extract hidden states for all training chunks (batched)
 TEACHER_BATCH = 64
 teacher_hiddens = []
-for start in range(0, num_chunks, TEACHER_BATCH):
+for start in tqdm(range(0, num_chunks, TEACHER_BATCH), desc="  Extracting teacher vectors"):
     end = min(start + TEACHER_BATCH, num_chunks)
     batch_ids = all_chunks[start:end]
     with torch.no_grad():
