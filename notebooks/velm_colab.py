@@ -845,14 +845,18 @@ if USE_GRADIENT_PHASE:
             e_losses = jax.vmap(pos_loss)(hid_in, z_target, keys)
             e_loss = jnp.mean(e_losses)
             # distillation loss: align backbone hidden with teacher
+            # use COSINE similarity (scale-invariant — prevents proj from cheating)
             teacher_targets = jax.vmap(tp)(batch_teacher)  # (B, dim)
             n = min(hid.shape[0], teacher_targets.shape[0])
-            # use mean over BOTH batch and dim (not sum over dim — overflows)
-            d_loss = jnp.mean((hid[:n] - teacher_targets[:n]) ** 2)
+            def cosine_dist(a, b):
+                a_norm = a / (jnp.linalg.norm(a) + 1e-8)
+                b_norm = b / (jnp.linalg.norm(b) + 1e-8)
+                return 1.0 - jnp.sum(a_norm * b_norm)  # 0=aligned, 2=opposite
+            d_loss = jnp.mean(jax.vmap(cosine_dist)(hid[:n], teacher_targets[:n]))
             # NaN guard
             d_loss = jnp.where(jnp.isfinite(d_loss), d_loss, 0.0)
             e_loss = jnp.where(jnp.isfinite(e_loss), e_loss, 100.0)
-            return e_loss + 0.5 * d_loss, {
+            return e_loss + 1.0 * d_loss, {
                 "energy_loss": e_loss,
                 "distill_loss": d_loss,
             }
@@ -884,7 +888,11 @@ if USE_GRADIENT_PHASE:
 
     for step in range(1, GRAD_STEPS + 1):
         key, batch_key, step_key = jax.random.split(key, 3)
-        idx = jax.random.randint(batch_key, (GRAD_BATCH,), 0, num_chunks)
+        # CRITICAL: sample CONTIGUOUS chunks so the backbone sees sequential
+        # context. Random independent chunks = impossible prediction task.
+        start_idx = jax.random.randint(
+            batch_key, (), 0, max(1, num_chunks - GRAD_BATCH))
+        idx = jnp.arange(GRAD_BATCH) + start_idx
         batch = jnp.array(all_chunks[idx])
         batch_teacher = jnp.array(all_teacher_vecs[idx])
         trainable, grad_opt_state, loss, metrics = grad_train_step(
@@ -1068,7 +1076,10 @@ full_opt_state = full_opt.init(trainable)
 
 for step in range(1, (EGGROLL_STEPS + 1) if USE_EGGROLL_PHASE else 0):
     key, batch_key, step_key = jax.random.split(key, 3)
-    idx = jax.random.randint(batch_key, (EVAL_BATCH,), 0, num_chunks)
+    # contiguous chunks for sequential prediction
+    start_idx = int(jax.random.randint(
+        batch_key, (), 0, max(1, num_chunks - EVAL_BATCH)))
+    idx = np.arange(start_idx, start_idx + EVAL_BATCH)
     batch = jnp.array(all_chunks[idx])
 
     # decide what to train this step
