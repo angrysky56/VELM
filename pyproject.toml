@@ -20,6 +20,7 @@ dependencies = [
     "tokenizers>=0.21",
     "transformers>=5.5.0",
     "matplotlib>=3.10.8",
+    "flash-linear-attention>=0.4.2",
 ]
 
 [project.optional-dependencies]
