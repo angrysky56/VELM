@@ -32,7 +32,6 @@ from jaxtyping import Array, Float
 
 def extract_teacher_vectors(
     teacher_model,
-    tokenizer,
     chunks: jnp.ndarray,
     ae_model,
     batch_size: int = 64,
@@ -40,17 +39,15 @@ def extract_teacher_vectors(
     """Extract teacher hidden states and project to VELM latent space.
 
     Pipeline:
-      1. Decode chunk token IDs back to text
-      2. Run teacher model to get hidden states
-      3. Pool hidden states per chunk (mean over K token positions)
-      4. Project to VELM latent dim via frozen AE encoder
+      1. Run teacher model to get hidden states
+      2. Pool hidden states per chunk (mean over K token positions)
+      3. Project to VELM latent dim via frozen AE encoder
 
     This runs ONCE on the dataset, producing target vectors that
     are saved and reused across training.
 
     Args:
         teacher_model: HuggingFace teacher model (e.g., Qwen3.5-0.8B)
-        tokenizer: shared tokenizer
         chunks: (N, K) int32 token IDs
         ae_model: frozen CALM autoencoder
         batch_size: processing batch size
@@ -58,11 +55,10 @@ def extract_teacher_vectors(
     Returns:
         (N, latent_dim) target vectors in VELM's latent space
     """
-    import torch
     import numpy as np
+    import torch
+
     num_chunks = chunks.shape[0]
-    chunk_size = chunks.shape[1]
-    teacher_dim = teacher_model.config.hidden_size
     all_teacher_hiddens = []
 
     teacher_model.eval()
@@ -74,10 +70,10 @@ def extract_teacher_vectors(
 
         with torch.no_grad():
             input_ids = torch.tensor(
-                np.array(batch_ids), dtype=torch.long, device=device)
+                np.array(batch_ids), dtype=torch.long, device=device
+            )
             # teacher forward → get last hidden states
-            outputs = teacher_model(
-                input_ids=input_ids, output_hidden_states=True)
+            outputs = teacher_model(input_ids=input_ids, output_hidden_states=True)
             # last layer hidden: (B, K, teacher_dim)
             last_hidden = outputs.hidden_states[-1]
             # mean-pool over K positions → (B, teacher_dim)
@@ -98,14 +94,12 @@ class TeacherProjection(eqx.Module):
 
     proj: eqx.nn.Linear
 
-    def __init__(
-        self, teacher_dim: int, latent_dim: int, *, key: jax.Array
-    ) -> None:
-        self.proj = eqx.nn.Linear(
-            teacher_dim, latent_dim, use_bias=False, key=key)
+    def __init__(self, teacher_dim: int, latent_dim: int, *, key: jax.Array) -> None:
+        self.proj = eqx.nn.Linear(teacher_dim, latent_dim, use_bias=False, key=key)
 
     def __call__(
-        self, teacher_vec: Float[Array, "teacher_dim"],
+        self,
+        teacher_vec: Float[Array, "teacher_dim"],
     ) -> Float[Array, "latent_dim"]:
         return self.proj(teacher_vec)
 
@@ -137,9 +131,15 @@ def distillation_loss(
 
 
 def combined_training_loss(
-    backbone_params, head_params, bb_static, hd_static,
-    frozen_ae, batch_tokens, teacher_vecs,
-    teacher_proj, step_key,
+    backbone_params,
+    head_params,
+    bb_static,
+    hd_static,
+    frozen_ae,
+    batch_tokens,
+    teacher_vecs,
+    teacher_proj,
+    step_key,
     alpha_energy: float = 1.0,
     alpha_distill: float = 0.5,
 ):
@@ -174,13 +174,13 @@ def combined_training_loss(
     hd = eqx.combine(head_params, hd_static)
 
     # encode chunks → target latents via frozen AE
-    tgt_z = jax.vmap(
-        lambda c: frozen_ae.encode(c, training=False)[0])(batch_tokens)
+    tgt_z = jax.vmap(lambda c: frozen_ae.encode(c, training=False)[0])(batch_tokens)
 
     # compress input for backbone
     def compress(chunk):
         embs = jax.vmap(frozen_ae.embedding)(chunk)
         return bb.compress_input(embs)
+
     inp_seq = jax.vmap(compress)(batch_tokens)
 
     # backbone forward → hidden states
@@ -188,9 +188,11 @@ def combined_training_loss(
 
     # --- Energy loss: predict z_{i+1} from h_i ---
     hid_in, z_target = hid[:-1], tgt_z[1:]
+
     def pos_energy(h, z_t, k):
         samples = hd(h, key=k, num_samples=8)
         return energy_score(samples, z_t)
+
     keys = jax.random.split(step_key, hid_in.shape[0])
     energy_losses = jax.vmap(pos_energy)(hid_in, z_target, keys)
     e_loss = jnp.mean(energy_losses)
@@ -201,9 +203,9 @@ def combined_training_loss(
         teacher_targets = jax.vmap(teacher_proj)(teacher_vecs)  # (B, dim)
         # align backbone hidden states with teacher targets
         # use all positions (not shifted like energy loss)
-        d_losses = jax.vmap(
-            lambda h, t: jnp.mean((h - t) ** 2)
-        )(hid, teacher_targets[:hid.shape[0]])
+        d_losses = jax.vmap(lambda h, t: jnp.mean((h - t) ** 2))(
+            hid, teacher_targets[: hid.shape[0]]
+        )
         d_loss = jnp.mean(d_losses)
     else:
         d_loss = 0.0

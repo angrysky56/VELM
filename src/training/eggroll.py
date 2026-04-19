@@ -52,19 +52,30 @@ def generate_low_rank_perturbation(
         return jax.random.normal(key, ())
 
     # Use static calculation for the flat size to avoid JAX tracing issues
-    size = math.prod(shape)
+    total_size = math.prod(shape)
+    if total_size == 0:
+        return jnp.zeros(shape)
 
-    if size <= rank:
+    # For low-rank, we interpret the shape as a matrix (Rows, Cols)
+    # If it's a vector, Rows=1. If it's a tensor, we flatten to (Prod(dims[:-1]), last_dim).
+    if len(shape) == 1:
+        rows, cols = 1, shape[0]
+    else:
+        rows = math.prod(shape[:-1])
+        cols = shape[-1]
+
+    # If the rank is higher than dimensions, just do full-rank
+    if rank >= min(rows, cols):
         return jax.random.normal(key, shape)
 
     k1, k2 = jax.random.split(key)
-    u = jax.random.normal(k1, (size, rank))
-    v = jax.random.normal(k2, (rank,))
+    u = jax.random.normal(k1, (rows, rank))
+    v = jax.random.normal(k2, (rank, cols))
 
-    # Normalize to maintain variance
-    u = u / jnp.sqrt(rank)
-    perturb = (u @ v).reshape(shape)
-    return perturb
+    # Scale to maintain Unit Variance: E = (U @ V) / sqrt(rank)
+    # Var((U@V)_ij) = sum_{k=1}^rank Var(U_ik * V_kj) = rank
+    perturb_2d = (u @ v) / jnp.sqrt(float(rank))
+    return perturb_2d.reshape(shape)
 
 
 def perturb_pytree(

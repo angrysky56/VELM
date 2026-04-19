@@ -19,15 +19,15 @@ Forward pass (inference):
   5. Loop with predicted tokens as next input
 """
 
+import equinox as eqx
 import jax
 import jax.numpy as jnp
-import equinox as eqx
 from jaxtyping import Array, Float, Int
 
 from .autoencoder import CALMAutoencoder
-from .miras_backbone import VELMBackbone
-from .energy_head import EnergyHead, energy_score
 from .config import CONFIGS, QWEN35_VOCAB_SIZE
+from .energy_head import EnergyHead, energy_score
+from .miras_backbone import VELMBackbone
 
 
 class VELM(eqx.Module):

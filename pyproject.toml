@@ -44,6 +44,13 @@ line-length = 100
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "N", "W", "UP"]
+ignore = [
+    "F722", # jaxtyping strings are not valid python identifiers
+    "F821", # jaxtyping dimensions are often undefined in local scope
+    "N806", # Allow uppercase matrix names (e.g. B, B2)
+    "N803", # Allow uppercase argument names for matrices (e.g. X, Q)
+    "E741", # Allow 'I' for identity matrix
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

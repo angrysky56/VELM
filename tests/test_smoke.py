@@ -16,7 +16,6 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 import jax
 import jax.numpy as jnp
 
-
 # use tiny dimensions for fast testing
 VOCAB = 256
 K = 4
@@ -57,7 +56,7 @@ def test_autoencoder_encode_decode():
 
 def test_autoencoder_loss():
     """Autoencoder loss computes and returns metrics."""
-    from src.model.autoencoder import CALMAutoencoder, batch_ae_loss
+    from src.model.autoencoder import CALMAutoencoder
 
     key = jax.random.PRNGKey(1)
     model = CALMAutoencoder(
@@ -199,7 +198,8 @@ def test_backbone_with_hc():
 def test_eggroll_perturbation():
     """EGGROLL low-rank perturbation generation."""
     from src.training.eggroll import (
-        generate_low_rank_perturbation, perturb_pytree,
+        generate_low_rank_perturbation,
+        perturb_pytree,
     )
 
     key = jax.random.PRNGKey(6)
@@ -229,7 +229,8 @@ def test_eggroll_perturbation():
 def test_eggroll_step():
     """EGGROLL optimizer step with tiny population."""
     from src.training.eggroll import (
-        eggroll_step, create_eggroll_optimizer,
+        create_eggroll_optimizer,
+        eggroll_step,
     )
 
     key = jax.random.PRNGKey(7)
@@ -256,8 +257,10 @@ def test_eggroll_step():
 def test_cib_budget():
     """CIB budget controller decisions."""
     from src.inference.cib_budget import (
-        CIBBudgetController, should_continue_reasoning,
-        estimate_difficulty, compute_info_gain,
+        CIBBudgetController,
+        compute_info_gain,
+        estimate_difficulty,
+        should_continue_reasoning,
     )
 
     controller = CIBBudgetController(
@@ -292,7 +295,8 @@ def test_cib_budget():
 def test_gea_novelty():
     """GEA novelty computation and selection."""
     from src.evolution.gea_eggroll import (
-        compute_novelty, performance_novelty_selection,
+        compute_novelty,
+        performance_novelty_selection,
     )
 
     key = jax.random.PRNGKey(8)
