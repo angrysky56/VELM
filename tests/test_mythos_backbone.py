@@ -45,7 +45,7 @@ def test_lti_stability():
     lti = LTIInjection(dim, key=key)
     
     # Get the A matrix
-    A = lti.get_A()
+    A = lti.get_a()
     
     # Check that all diagonal elements are < 1
     assert jnp.all(A < 1.0)

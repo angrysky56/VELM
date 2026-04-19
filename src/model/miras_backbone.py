@@ -42,24 +42,23 @@ class LTIInjection(eqx.Module):
     """Linear Time-Invariant (LTI) stable injection module.
 
     Guarantees recurrent stability by enforcing spectral radius ρ(A) < 1.
-    A_discrete = exp(-exp(log_dt + log_A))
+    A_discrete = exp(-exp(log_dt + log_a))
     """
 
-    log_A: Float[Array, "dim"]
+    log_a: Float[Array, "dim"]
     log_dt: Float[Array, "1"]
-    B: Float[Array, "dim"]
+    b_injection: Float[Array, "dim"]
 
     def __init__(self, dim: int, *, key: jax.Array) -> None:
-        k1, k2 = jax.random.split(key)
-        self.log_A = jnp.zeros(dim)
+        self.log_a = jnp.zeros(dim)
         self.log_dt = jnp.zeros(1)
         # Small initialization for input injection weight
-        self.B = jax.random.normal(k1, (dim,)) * 0.01
+        self.b_injection = jax.random.normal(key, (dim,)) * 0.01
 
-    def get_A(self) -> Float[Array, "dim"]:
+    def get_a(self) -> Float[Array, "dim"]:
         """Compute the stable transition matrix (diagonal)."""
         # Clamping prevents numerical instability in exp(exp(x))
-        exponent = jnp.clip(self.log_dt + self.log_A, -20, 20)
+        exponent = jnp.clip(self.log_dt + self.log_a, -20, 20)
         return jnp.exp(-jnp.exp(exponent))
 
     def __call__(
@@ -69,8 +68,8 @@ class LTIInjection(eqx.Module):
         block_out: Float[Array, "dim"],
     ) -> Float[Array, "dim"]:
         """Apply the LTI update: h_{t+1} = A*h_t + B*e + block_out."""
-        A = self.get_A()
-        return A * h + self.B * e + block_out
+        a_diagonal = self.get_a()
+        return a_diagonal * h + self.b_injection * e + block_out
 
 
 class ACTHalting(eqx.Module):
@@ -597,9 +596,7 @@ class VELMBackbone(eqx.Module):
 
         # Mythos components
         self.lti = LTIInjection(dim, key=keys[total_layers + 2])
-        self.halting = (
-            ACTHalting(dim, key=keys[total_layers + 3]) if use_act else None
-        )
+        self.halting = ACTHalting(dim, key=keys[total_layers + 3]) if use_act else None
 
         # input compression: K embeddings → single vector
         # CALM paper uses 2-layer MLP for this
@@ -656,8 +653,7 @@ class VELMBackbone(eqx.Module):
         # go-mHC hyper-connection blocks (one per layer)
         # when hc_streams=1, these are no-ops (standard residual)
         if hc_streams > 1:
-            hc_keys = jax.random.split(
-                jax.random.PRNGKey(999), total_layers)
+            hc_keys = jax.random.split(jax.random.PRNGKey(999), total_layers)
             self.hc_blocks = [
                 HyperConnectionBlock(d=hc_streams, s=hc_s, key=hc_keys[i])
                 for i in range(total_layers)
@@ -717,10 +713,36 @@ class VELMBackbone(eqx.Module):
 
             # Experimental: ACT Halting
             if self.halting is not None:
+                # Initialize ACT states if first loop
+                if loop_idx == 0:
+                    accum_p = jnp.zeros(x.shape[0])
+                    h_acc = jnp.zeros_like(x)
+                    still_active = jnp.ones(x.shape[0])
+
                 # (T, 1) probability of halting
-                # p_halt = jax.vmap(self.halting)(h)
-                # TODO: Implement full ACT masking if needed
-                pass
+                p_halt = jax.vmap(self.halting)(h).squeeze(-1)
+                
+                # Determine weight for this step (Graves, 2016)
+                new_accum_p = accum_p + p_halt * still_active
+                # We halt when accum_p >= 1.0 - epsilon
+                # Using 0.99 as a stable threshold
+                halted_now = (new_accum_p >= 0.99) & (still_active > 0.5)
+                
+                # weight = p_halt if not halting, else remainder
+                weight = jnp.where(halted_now, 1.0 - accum_p, p_halt * still_active)
+                
+                h_acc = h_acc + weight[:, None] * h
+                accum_p = new_accum_p
+                still_active = still_active * (1.0 - halted_now.astype(jnp.float32))
+                
+                # If this was the last loop, we must add any remaining weight to the last state
+                if loop_idx == num_loops - 1:
+                    remainder = 1.0 - accum_p
+                    h_acc = h_acc + (remainder * still_active)[:, None] * h
+                    h = h_acc
+            
+            # If not using ACT, the final h after the loop is used naturally.
+            # If using ACT, h is updated to h_acc in the last iteration above.
 
         # Collapse and normalize
         h = jax.vmap(self.final_norm)(h)
