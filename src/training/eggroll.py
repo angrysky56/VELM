@@ -19,8 +19,9 @@ Algorithm:
 
 # ruff: noqa: F722, F821
 
-from collections.abc import Callable
 import math
+from collections.abc import Callable
+
 import jax
 import jax.numpy as jnp
 import optax
@@ -49,17 +50,17 @@ def generate_low_rank_perturbation(
     """
     if len(shape) == 0:  # Scalar
         return jax.random.normal(key, ())
-    
+
     # Use static calculation for the flat size to avoid JAX tracing issues
     size = math.prod(shape)
-    
+
     if size <= rank:
         return jax.random.normal(key, shape)
-        
+
     k1, k2 = jax.random.split(key)
     u = jax.random.normal(k1, (size, rank))
     v = jax.random.normal(k2, (rank,))
-    
+
     # Normalize to maintain variance
     u = u / jnp.sqrt(rank)
     perturb = (u @ v).reshape(shape)
@@ -202,16 +203,17 @@ def eggroll_step(
             _, perturbation = perturb_pytree(base_params, member_key, sigma, rank)
             # positive direction: W + σE
             pos_params = jax.tree.map(
-                lambda p, e: p + sigma * e, base_params, perturbation)
+                lambda p, e: p + sigma * e, base_params, perturbation
+            )
             f_pos = fitness_fn(pos_params)
             # negative direction: W - σE
             neg_params = jax.tree.map(
-                lambda p, e: p - sigma * e, base_params, perturbation)
+                lambda p, e: p - sigma * e, base_params, perturbation
+            )
             f_neg = fitness_fn(neg_params)
             return f_pos, f_neg, perturbation
 
-        f_pos_arr, f_neg_arr, perturbations_stacked = jax.lax.map(
-            eval_antithetic, keys)
+        f_pos_arr, f_neg_arr, perturbations_stacked = jax.lax.map(eval_antithetic, keys)
 
         # antithetic ES gradient: (1/2σN) Σ (f+ - f-) * E
         diffs = f_pos_arr - f_neg_arr  # (N,)
