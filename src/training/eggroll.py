@@ -20,7 +20,7 @@ Algorithm:
 # ruff: noqa: F722, F821
 
 from collections.abc import Callable
-
+import math
 import jax
 import jax.numpy as jnp
 import optax
@@ -47,24 +47,23 @@ def generate_low_rank_perturbation(
     Returns:
         Perturbation with same shape as target parameter
     """
-    if len(shape) == 1:
-        # vector parameter: simple Gaussian perturbation
+    if len(shape) == 0:  # Scalar
+        return jax.random.normal(key, ())
+    
+    # Use static calculation for the flat size to avoid JAX tracing issues
+    size = math.prod(shape)
+    
+    if size <= rank:
         return jax.random.normal(key, shape)
-
-    elif len(shape) == 2:
-        # matrix parameter: low-rank perturbation
-        m, n = shape
-        k1, k2 = jax.random.split(key)
-        a = jax.random.normal(k1, (m, rank))
-        b = jax.random.normal(k2, (n, rank))
-        return (1.0 / jnp.sqrt(rank)) * (a @ b.T)
-    else:
-        # higher-order tensor: reshape → perturb → reshape back
-        total = 1
-        for s in shape[1:]:
-            total *= s
-        flat = generate_low_rank_perturbation(key, (shape[0], total), rank)
-        return flat.reshape(shape)
+        
+    k1, k2 = jax.random.split(key)
+    u = jax.random.normal(k1, (size, rank))
+    v = jax.random.normal(k2, (rank,))
+    
+    # Normalize to maintain variance
+    u = u / jnp.sqrt(rank)
+    perturb = (u @ v).reshape(shape)
+    return perturb
 
 
 def perturb_pytree(
