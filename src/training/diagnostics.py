@@ -45,7 +45,7 @@ class EGGROLLDiagnostics:
     plateau_window: int = 50
     plateau_threshold: float = 0.001
     history: list[dict] = field(default_factory=list)
-    _initial_param_norms: dict[str, float] = field(default_factory=dict)
+    _initial_params: PyTree | None = None
     is_plateaued: bool = False
     nan_count: int = 0
 
@@ -82,18 +82,21 @@ class EGGROLLDiagnostics:
         # parameter norms per leaf
         param_norms = _compute_param_norms(params)
 
-        # store initial norms for drift computation
-        if step == 1 or not self._initial_param_norms:
-            self._initial_param_norms = dict(param_norms)
+        # store initial parameters for true displacement computation
+        if step == 1 or not self._initial_params:
+            self._initial_params = params
 
-        # parameter drift from initial
+        # parameter drift: Euclidean distance from initialization normalized by initial norm
         drift = {}
-        for name, norm in param_norms.items():
-            init_norm = self._initial_param_norms.get(name, norm)
-            if init_norm > 0:
-                drift[name] = abs(norm - init_norm) / init_norm
-            else:
-                drift[name] = 0.0
+        curr_leaves = jax.tree.leaves(params)
+        init_leaves = jax.tree.leaves(self._initial_params)
+        paths = _get_leaf_paths(params)
+
+        for path, curr, init in zip(paths, curr_leaves, init_leaves):
+            if hasattr(curr, "shape"):
+                dist = float(jnp.sqrt(jnp.sum((curr - init)**2)))
+                init_norm = float(jnp.sqrt(jnp.sum(init**2)))
+                drift[path] = dist / (init_norm + 1e-8)
 
         # population diversity: fitness spread
         diversity = fit_std / (abs(mean_fit) + 1e-8)
@@ -108,7 +111,6 @@ class EGGROLLDiagnostics:
             "has_nan": has_nan,
             "diversity": diversity,
             "max_drift": max(drift.values()) if drift else 0.0,
-            "param_norms": param_norms,
             "param_drift": drift,
         }
         self.history.append(entry)

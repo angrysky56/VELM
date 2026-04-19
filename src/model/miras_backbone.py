@@ -721,26 +721,26 @@ class VELMBackbone(eqx.Module):
 
                 # (T, 1) probability of halting
                 p_halt = jax.vmap(self.halting)(h).squeeze(-1)
-                
+
                 # Determine weight for this step (Graves, 2016)
                 new_accum_p = accum_p + p_halt * still_active
                 # We halt when accum_p >= 1.0 - epsilon
                 # Using 0.99 as a stable threshold
                 halted_now = (new_accum_p >= 0.99) & (still_active > 0.5)
-                
+
                 # weight = p_halt if not halting, else remainder
                 weight = jnp.where(halted_now, 1.0 - accum_p, p_halt * still_active)
-                
+
                 h_acc = h_acc + weight[:, None] * h
                 accum_p = new_accum_p
                 still_active = still_active * (1.0 - halted_now.astype(jnp.float32))
-                
+
                 # If this was the last loop, we must add any remaining weight to the last state
                 if loop_idx == num_loops - 1:
                     remainder = 1.0 - accum_p
                     h_acc = h_acc + (remainder * still_active)[:, None] * h
                     h = h_acc
-            
+
             # If not using ACT, the final h after the loop is used naturally.
             # If using ACT, h is updated to h_acc in the last iteration above.
 

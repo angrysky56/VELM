@@ -274,6 +274,40 @@ def eggroll_step(
     return new_params, new_state, metrics
 
 
+class SigmaAdaptor:
+    """Dynamic adaptation for ES perturbation scale (sigma).
+
+    Adjusts sigma to maintain a target population diversity
+    (fitness_std / |mean_fitness|).
+
+    Similar to the 1/5th rule in evolution strategies:
+    - If diversity < target/2: increase sigma (more exploration)
+    - If diversity > target*2: decrease sigma (more precision)
+    """
+
+    def __init__(
+        self,
+        initial_sigma: float = 0.001,
+        target_diversity: float = 0.02,
+        adjustment_rate: float = 1.05,
+        min_sigma: float = 1e-5,
+        max_sigma: float = 0.1,
+    ) -> None:
+        self.sigma = initial_sigma
+        self.target_diversity = target_diversity
+        self.rate = adjustment_rate
+        self.min_sigma = min_sigma
+        self.max_sigma = max_sigma
+
+    def update(self, current_diversity: float) -> float:
+        """Update and return the new sigma."""
+        if current_diversity < self.target_diversity / 2.0:
+            self.sigma = min(self.max_sigma, self.sigma * self.rate)
+        elif current_diversity > self.target_diversity * 2.0:
+            self.sigma = max(self.min_sigma, self.sigma / self.rate)
+        return self.sigma
+
+
 def discretize_update_int8(
     params_int8: PyTree,
     es_gradient: PyTree,
