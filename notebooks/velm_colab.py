@@ -917,11 +917,14 @@ USE_EGGROLL_PHASE = True  # EGGROLL is the primary training method (non-negotiab
 
 # --- FIX: Start of inserted code to fix RecursionError in eggroll.py ---
 import functools
+import math  # Import math for static product
+
 import jax
 import jax.numpy as jnp
 from jax import random
+
 import src.training.eggroll
-import math # Import math for static product
+
 
 def generate_low_rank_perturbation_correct(key: random.PRNGKey, shape: tuple[int, ...], rank: int) -> jax.Array:
     """Generates a low-rank perturbation for a given shape and rank.
@@ -1080,6 +1083,7 @@ elif USE_EGGROLL_PHASE:
     print("=" * 60)
 
 from src.training.diagnostics import EGGROLLDiagnostics
+
 diag = EGGROLLDiagnostics(plateau_window=50, plateau_threshold=0.001)
 
 egg_history = {"mean_fitness": [], "max_fitness": [], "grad_norm": [], "phase": [],
@@ -1408,8 +1412,9 @@ try:
 except NameError:
     print("Diagnostics not available. Please run the EGGROLL training cell first.")
 
-import equinox as eqx
 import os
+
+import equinox as eqx
 
 bb_path = "checkpoints/backbone_eggroll.eqx"
 hd_path = "checkpoints/energy_head_eggroll.eqx"
