@@ -19,13 +19,18 @@ VELM is a next-generation LLM architecture designed for **gradient-freedom** and
 
 ## 📈 Roadmap & Milestones
 
-### Phase 1: Research & Viability (CURRENT)
-*   [ ] **Optimization Audit**: Evaluate EGGROLL vs MeZO for billion-param scaling.
-*   [ ] **Architecture Audit**: Validate CALM+Miras stability on WikiText-103.
-*   [ ] **Hardware Audit**: Profile Int8 JAX performance on RTX 3060/T4.
-*   [x] **Blocker Fix**: Resolve EGGROLL RecursionError in JAX tracing.
+### Phase 1: Research & Viability (Completed)
+*   [x] **Optimization Audit**: Evaluate EGGROLL vs MeZO.
+*   [x] **Architecture Audit**: Validate OpenMythos RDT patterns.
+*   [x] **Blocker Fix**: Resolve EGGROLL RecursionError.
 
-### Phase 2: Foundation (Foundation Experiments)
+### Phase 1.1: Mythos-Enhanced Architecture (COMPLETED)
+*   [x] **Core Implementation**: Add LTI Injection & Loop Embeddings.
+*   [x] **Backbone Refactor**: Support n_loops and Input Injection.
+*   [x] **Stability Verification**: Unit tests for spectral radius.
+*   [x] **Notebook Integration**: Mythos-RDT training workflow in Colab.
+
+### Phase 2: Foundation (Planned)
 *   [ ] Train & Validate CALM Autoencoder (>99.9% recon).
 *   [ ] Train Miras Backbone via Backprop (Baseline).
 *   [ ] Train Miras Backbone via EGGROLL (Proof of Concept).

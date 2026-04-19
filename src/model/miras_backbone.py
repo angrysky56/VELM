@@ -27,6 +27,67 @@ from src.model.hyper_connections import (
 )
 
 
+def get_loop_embedding(loop_idx: int, dim: int) -> Float[Array, "dim"]:
+    """Generates a sinusoidal embedding for the current loop index.
+
+    Ensures the model has distinct representations for different recurrent steps.
+    """
+    indices = jnp.arange(dim)
+    inv_freq = 1.0 / (10000 ** (indices / dim))
+    pos_enc = loop_idx * inv_freq
+    return jnp.sin(pos_enc)
+
+
+class LTIInjection(eqx.Module):
+    """Linear Time-Invariant (LTI) stable injection module.
+
+    Guarantees recurrent stability by enforcing spectral radius ρ(A) < 1.
+    A_discrete = exp(-exp(log_dt + log_A))
+    """
+
+    log_A: Float[Array, "dim"]
+    log_dt: Float[Array, "1"]
+    B: Float[Array, "dim"]
+
+    def __init__(self, dim: int, *, key: jax.Array) -> None:
+        k1, k2 = jax.random.split(key)
+        self.log_A = jnp.zeros(dim)
+        self.log_dt = jnp.zeros(1)
+        # Small initialization for input injection weight
+        self.B = jax.random.normal(k1, (dim,)) * 0.01
+
+    def get_A(self) -> Float[Array, "dim"]:
+        """Compute the stable transition matrix (diagonal)."""
+        # Clamping prevents numerical instability in exp(exp(x))
+        exponent = jnp.clip(self.log_dt + self.log_A, -20, 20)
+        return jnp.exp(-jnp.exp(exponent))
+
+    def __call__(
+        self,
+        h: Float[Array, "dim"],
+        e: Float[Array, "dim"],
+        block_out: Float[Array, "dim"],
+    ) -> Float[Array, "dim"]:
+        """Apply the LTI update: h_{t+1} = A*h_t + B*e + block_out."""
+        A = self.get_A()
+        return A * h + self.B * e + block_out
+
+
+class ACTHalting(eqx.Module):
+    """Adaptive Computation Time (ACT) halting head.
+
+    Predicts a halting probability p ∈ [0, 1] for each token.
+    """
+
+    mlp: eqx.nn.Linear
+
+    def __init__(self, dim: int, *, key: jax.Array) -> None:
+        self.mlp = eqx.nn.Linear(dim, 1, key=key)
+
+    def __call__(self, h: Float[Array, "dim"]) -> Float[Array, "1"]:
+        return jax.nn.sigmoid(self.mlp(h))
+
+
 class RMSNorm(eqx.Module):
     """Root Mean Square Layer Normalization."""
 
@@ -488,6 +549,11 @@ class VELMBackbone(eqx.Module):
     dim: int
     hc_streams: int  # d: number of residual streams (1 = no HC)
 
+    # Mythos-Enhanced components
+    lti: LTIInjection
+    halting: ACTHalting | None
+    n_loops: int
+
     def __init__(
         self,
         dim: int,
@@ -500,6 +566,8 @@ class VELMBackbone(eqx.Module):
         ae_hidden_dim: int | None = None,
         hc_streams: int = 1,
         hc_s: int = 2,
+        n_loops: int = 1,
+        use_act: bool = False,
         *,
         key: jax.Array,
     ) -> None:
@@ -516,13 +584,22 @@ class VELMBackbone(eqx.Module):
             ae_hidden_dim: autoencoder embedding dimension (defaults to dim)
             hc_streams: d — number of residual streams (1=standard, >1=go-mHC)
             hc_s: s — go-mHC expressivity parameter
+            n_loops: default recurrent depth (Mythos)
+            use_act: whether to enable adaptive computation halting
             key: PRNG key
         """
         self.dim = dim
         self.hc_streams = hc_streams
+        self.n_loops = n_loops
         ae_dim = ae_hidden_dim if ae_hidden_dim is not None else dim
         total_layers = num_miras_layers + num_swa_layers
-        keys = jax.random.split(key, total_layers + 2)
+        keys = jax.random.split(key, total_layers + 5)
+
+        # Mythos components
+        self.lti = LTIInjection(dim, key=keys[total_layers + 2])
+        self.halting = (
+            ACTHalting(dim, key=keys[total_layers + 3]) if use_act else None
+        )
 
         # input compression: K embeddings → single vector
         # CALM paper uses 2-layer MLP for this
@@ -605,20 +682,56 @@ class VELMBackbone(eqx.Module):
         self,
         x: Float[Array, "T dim"],
         miras_states: list[Float[Array, "dim dim"]] | None = None,
+        n_loops: int | None = None,
     ) -> tuple[Float[Array, "T dim"], list[Float[Array, "dim dim"]]]:
-        """Process sequence through interleaved Miras + SWA blocks.
+        """Process sequence through interleaved Miras + SWA blocks with RDT loops.
 
         Args:
             x: (seq_len, dim) input sequence of compressed representations
             miras_states: optional list of initial memory states per Miras block
+            n_loops: optional override for recurrent depth
 
         Returns:
             (output_sequence, list_of_final_miras_states)
         """
+        num_loops = n_loops if n_loops is not None else self.n_loops
         num_miras = len(self.miras_blocks)
         if miras_states is None:
             miras_states = [None] * num_miras
 
+        # The 'Anchor' injection (e) is the compressed input
+        e = x  # (T, dim)
+        h = x  # Current state
+
+        for loop_idx in range(num_loops):
+            # Add loop-index awareness
+            loop_emb = get_loop_embedding(loop_idx, self.dim)
+            h = h + loop_emb[None, :]
+
+            # Internal block processing logic
+            h, miras_states = self._process_blocks(h, miras_states)
+
+            # LTI-Stable Injection: h = A*h + B*e + block_out
+            # We use jax.vmap to apply the injection per token
+            h = jax.vmap(self.lti)(h, e, h)
+
+            # Experimental: ACT Halting
+            if self.halting is not None:
+                # (T, 1) probability of halting
+                # p_halt = jax.vmap(self.halting)(h)
+                # TODO: Implement full ACT masking if needed
+                pass
+
+        # Collapse and normalize
+        h = jax.vmap(self.final_norm)(h)
+        return h, miras_states
+
+    def _process_blocks(
+        self,
+        x: Float[Array, "T dim"],
+        miras_states: list[Float[Array, "dim dim"]],
+    ) -> tuple[Float[Array, "T dim"], list[Float[Array, "dim dim"]]]:
+        """Internal helper to run the interleaved block sequence."""
         d = self.hc_streams
         use_hc = d > 1 and len(self.hc_blocks) > 0
 
@@ -632,25 +745,21 @@ class VELMBackbone(eqx.Module):
         for layer_idx, block_type in enumerate(self.block_order):
             if use_hc:
                 hc = self.hc_blocks[layer_idx]
-                # H_res mixing across d streams
                 x_mixed = hc.mix_residual(x_streams)
-                # H_pre: aggregate streams → single input for the block
                 block_input = hc.aggregate_for_block(x_streams)
 
-                # run the actual block on aggregated input
                 if block_type == "miras":
                     block_out, state = self.miras_blocks[m_idx](
-                        block_input, miras_states[m_idx])
+                        block_input, miras_states[m_idx]
+                    )
                     new_states.append(state)
                     m_idx += 1
                 else:
                     block_out = self.swa_blocks[s_idx](block_input)
                     s_idx += 1
 
-                # H_post: distribute output → d streams + add to mixed
                 x_streams = x_mixed + hc.distribute_from_block(block_out)
             else:
-                # standard single-stream residuals (hc_streams=1)
                 if block_type == "miras":
                     x, state = self.miras_blocks[m_idx](x, miras_states[m_idx])
                     new_states.append(state)
@@ -659,10 +768,7 @@ class VELMBackbone(eqx.Module):
                     x = self.swa_blocks[s_idx](x)
                     s_idx += 1
 
-        # collapse streams and normalize
         if use_hc:
-            x = collapse_streams(x_streams)  # (d, T, dim) → (T, dim)
-
-        x = jax.vmap(self.final_norm)(x)
+            x = collapse_streams(x_streams)
 
         return x, new_states

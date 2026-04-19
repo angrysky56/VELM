@@ -60,6 +60,8 @@ CONFIGS: dict[str, dict] = {
         "eggroll_eval_batch": 64,     # balance speed vs stability on T4
         "hc_streams": 4,             # d: number of residual streams (go-mHC)
         "hc_s": 2,                   # s: orthostochastic expressivity param
+        "n_loops": 1,                # Recurrent depth (Mythos-Enhanced RDT)
+        "use_act": False,            # Adaptive Compute Time (ACT)
     },
     # Smoke test / CI — minimal viable forward pass
     "smoke": {
