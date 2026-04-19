@@ -73,30 +73,30 @@ class EGGROLLDiagnostics:
 
         # NaN detection
         has_nan = not (
-            jnp.isfinite(jnp.array(mean_fit))
-            and jnp.isfinite(jnp.array(max_fit))
+            jnp.isfinite(jnp.array(mean_fit)) and jnp.isfinite(jnp.array(max_fit))
         )
         if has_nan:
             self.nan_count += 1
-
-        # parameter norms per leaf
-        param_norms = _compute_param_norms(params)
 
         # store initial parameters for true displacement computation
         if step == 1 or not self._initial_params:
             self._initial_params = params
 
-        # parameter drift: Euclidean distance from initialization normalized by initial norm
-        drift = {}
+        drift_sums = {}
+        drift_counts = {}
         curr_leaves = jax.tree.leaves(params)
         init_leaves = jax.tree.leaves(self._initial_params)
         paths = _get_leaf_paths(params)
 
         for path, curr, init in zip(paths, curr_leaves, init_leaves):
             if hasattr(curr, "shape"):
-                dist = float(jnp.sqrt(jnp.sum((curr - init)**2)))
+                dist = float(jnp.sqrt(jnp.sum((curr - init) ** 2)))
                 init_norm = float(jnp.sqrt(jnp.sum(init**2)))
-                drift[path] = dist / (init_norm + 1e-8)
+                d_val = dist / (init_norm + 1e-8)
+                drift_sums[path] = drift_sums.get(path, 0.0) + d_val
+                drift_counts[path] = drift_counts.get(path, 0) + 1
+
+        drift = {k: v / drift_counts[k] for k, v in drift_sums.items()}
 
         # population diversity: fitness spread
         diversity = fit_std / (abs(mean_fit) + 1e-8)
@@ -126,7 +126,7 @@ class EGGROLLDiagnostics:
             self.is_plateaued = False
             return
 
-        recent = self.history[-self.plateau_window:]
+        recent = self.history[-self.plateau_window :]
         fitnesses = [e["mean_fitness"] for e in recent]
         improvement = max(fitnesses) - min(fitnesses)
         self.is_plateaued = improvement < self.plateau_threshold
@@ -180,8 +180,8 @@ class EGGROLLDiagnostics:
                 last["param_drift"].items(), key=lambda x: x[1], reverse=True
             )
             for name, d in sorted_drift[:5]:
-                bar = "█" * min(int(d * 50), 50)
-                lines.append(f"  {name:40s} {d:8.4f} {bar}")
+                drift_bar = "█" * min(int(d * 50), 50)
+                lines.append(f"  {name:40s} {d:8.4f} {drift_bar}")
 
         # recent steps detail
         lines.append(f"\nLast {min(last_n, total_steps)} steps:")
@@ -233,7 +233,7 @@ def _compute_param_norms(params: PyTree) -> dict[str, float]:
 
     Returns a dict mapping leaf path → L2 norm.
     """
-    leaves, treedef = jax.tree.flatten(params)
+    leaves, _ = jax.tree.flatten(params)
     # reconstruct paths from treedef
     paths = _get_leaf_paths(params)
 
@@ -244,19 +244,17 @@ def _compute_param_norms(params: PyTree) -> dict[str, float]:
     return norms
 
 
-def _get_leaf_paths(tree: PyTree, prefix: str = "") -> list[str]:
-    """Extract string paths for each leaf in a pytree."""
-    paths = []
+def _get_leaf_paths(tree: PyTree) -> list[str]:
+    """Extract string paths for each leaf in a pytree using JAX native pathing."""
+    leaves, _ = jax.tree_util.tree_flatten(tree)
+
+    # If it's a simple dict of modules (like our 'trainable'), try to provide better names
     if isinstance(tree, dict):
-        for key in sorted(tree.keys()):
-            child_prefix = f"{prefix}.{key}" if prefix else str(key)
-            paths.extend(_get_leaf_paths(tree[key], child_prefix))
-    elif isinstance(tree, (list, tuple)):
-        for i, child in enumerate(tree):
-            child_prefix = f"{prefix}[{i}]"
-            paths.extend(_get_leaf_paths(child, child_prefix))
-    else:
-        # leaf node
-        leaf_name = prefix if prefix else "param"
-        paths.append(leaf_name)
-    return paths
+        all_paths = []
+        for k, v in sorted(tree.items()):
+            child_leaves = jax.tree_util.tree_leaves(v)
+            all_paths.extend([f"{k}" for _ in range(len(child_leaves))])
+        if len(all_paths) == len(leaves):
+            return all_paths
+
+    return ["param" for _ in range(len(leaves))]

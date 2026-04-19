@@ -47,6 +47,8 @@ from src.training.eggroll import perturb_pytree  # used in Phase 2 custom ES loo
 
 print("✓ VELM modules imported")
 
+import glob
+import shutil
 import time
 
 import equinox as eqx
@@ -1105,6 +1107,12 @@ full_opt = optax.chain(
 )  # lower lr for full
 full_opt_state = full_opt.init(trainable)
 
+diag = EGGROLLDiagnostics()
+adaptor = SigmaAdaptor(initial_sigma=SIGMA, target_diversity=0.02)
+
+start = time.time()
+print(f"🚀 Starting EGGROLL (Target Diversity: 0.02)")
+
 for step in range(1, (EGGROLL_STEPS + 1) if USE_EGGROLL_PHASE else 0):
     key, batch_key, step_key = jax.random.split(key, 3)
     # contiguous chunks for sequential prediction
@@ -1142,32 +1150,31 @@ for step in range(1, (EGGROLL_STEPS + 1) if USE_EGGROLL_PHASE else 0):
         active_params = trainable
         phase_label = "full"
 
-    # evaluate population with antithetic sampling
+    # evaluate population with adaptive sigma and rank-adaptive sampling
     member_keys = jax.random.split(step_key, POP_SIZE)
-    fitnesses_list = []
-    perturbations_list = []
-    fitness_diffs = []
+    fitnesses_list, fitness_diffs, perts = [], [], []
+    curr_rank = 1 if training_head_only else 2
 
     for member_key in member_keys:
-        _, pert = perturb_pytree(active_params, member_key, SIGMA, rank=1)
+        _, pert = perturb_pytree(active_params, member_key, adaptor.sigma, rank=curr_rank)
 
         if training_head_only:
             # perturb head only, backbone stays frozen
             pos_full = {
                 "backbone": trainable["backbone"],
                 "head": jax.tree.map(
-                    lambda p, e: p + SIGMA * e, active_params["head"], pert["head"]
+                    lambda p, e: p + adaptor.sigma * e, active_params["head"], pert["head"]
                 ),
             }
             neg_full = {
                 "backbone": trainable["backbone"],
                 "head": jax.tree.map(
-                    lambda p, e: p - SIGMA * e, active_params["head"], pert["head"]
+                    lambda p, e: p - adaptor.sigma * e, active_params["head"], pert["head"]
                 ),
             }
         else:
-            pos_full = jax.tree.map(lambda p, e: p + SIGMA * e, active_params, pert)
-            neg_full = jax.tree.map(lambda p, e: p - SIGMA * e, active_params, pert)
+            pos_full = jax.tree.map(lambda p, e: p + adaptor.sigma * e, active_params, pert)
+            neg_full = jax.tree.map(lambda p, e: p - adaptor.sigma * e, active_params, pert)
 
         f_pos = evaluate_params(pos_full, batch)
         f_neg = evaluate_params(neg_full, batch)
@@ -1178,16 +1185,16 @@ for step in range(1, (EGGROLL_STEPS + 1) if USE_EGGROLL_PHASE else 0):
     fitnesses_arr = jnp.array(fitnesses_list)
     diffs_arr = jnp.array(fitness_diffs)
 
-    # antithetic ES gradient
-    leaves_list = [jax.tree.leaves(p) for p in perturbations_list]
-    treedef = jax.tree.structure(perturbations_list[0])
+    # Compute ES Gradient
+    treedef = jax.tree.structure(perts[0])
     es_grad_leaves = []
-    for j in range(len(leaves_list[0])):
-        stacked = jnp.stack([ll[j] for ll in leaves_list], axis=0)
+    for j in range(len(jax.tree.leaves(perts[0]))):
+        stacked = jnp.stack([jax.tree.leaves(p)[j] for p in perts], axis=0)
         w = diffs_arr.reshape((-1,) + (1,) * (stacked.ndim - 1))
         es_grad_leaves.append(jnp.sum(stacked * w, axis=0))
+
     es_grad = jax.tree.unflatten(treedef, es_grad_leaves)
-    neg_grad = jax.tree.map(lambda g: g * (-1.0 / (2.0 * SIGMA * POP_SIZE)), es_grad)
+    neg_grad = jax.tree.map(lambda g: g * (-1.0 / (2.0 * adaptor.sigma * POP_SIZE)), es_grad)
 
     # Adam update on the active param set
     if training_head_only:
@@ -1201,45 +1208,14 @@ for step in range(1, (EGGROLL_STEPS + 1) if USE_EGGROLL_PHASE else 0):
 
     # logging every 100 steps
     if step % 100 == 0:
-        mf = float(jnp.mean(fitnesses_arr))
-        xf = float(jnp.max(fitnesses_arr))
-        gn = float(jnp.sqrt(sum(jnp.sum(leaf**2) for leaf in jax.tree.leaves(es_grad))))
-        is_nan = not (jnp.isfinite(mf) and jnp.isfinite(xf))
-        if is_nan:
-            _nan_total += 1
-        egg_history["mean_fitness"].append(mf if not is_nan else float("nan"))
-        egg_history["max_fitness"].append(xf if not is_nan else float("nan"))
-        egg_history["grad_norm"].append(gn)
-        egg_history["phase"].append(phase_label)
-        egg_history["nan_count"].append(_nan_total)
-        elapsed = time.time() - start
-        fs = float(jnp.std(fitnesses_arr)) if not is_nan else 0.0
-        egg_history["fitness_std"].append(fs)
-        nan_flag = " ⚠NaN" if is_nan else ""
-        print(
-            f"  step {step:>5}/{EGGROLL_STEPS} [{phase_label:>4}] | "
-            f"mean_f: {mf:.4f} | max_f: {xf:.4f} | "
-            f"grad: {gn:.4f} | {elapsed/60:.0f}m{nan_flag}"
-        )
+        mf, xf, fs = float(jnp.mean(fitnesses_arr)), float(jnp.max(fitnesses_arr)), float(jnp.std(fitnesses_arr))
+        gn = float(jnp.sqrt(sum(jnp.sum(l**2) for l in jax.tree.leaves(es_grad))))
 
-        # --- log to diagnostics for accurate parameter drift ---
-        current_params = trainable
-        if training_head_only:
-            current_params = {
-                "backbone": trainable["backbone"],
-                "head": head_trainable["head"],
-            }
-        diag.log_step(
-            step,
-            current_params,
-            {
-                "mean_fitness": mf if not is_nan else float("nan"),
-                "max_fitness": xf if not is_nan else float("nan"),
-                "fitness_std": fs,
-                "grad_norm": gn,
-            }
-        )
-        # --------------------------------------------------------
+        curr_p = trainable if not training_head_only else {"backbone": trainable["backbone"], "head": head_trainable["head"]}
+        entry = diag.log_step(step, curr_p, {"mean_fitness": mf, "max_fitness": xf, "fitness_std": fs, "grad_norm": gn})
+        adaptor.update(entry['diversity'])
+
+        print(f"  step {step:>5} | mean_f: {mf:.4f} | max_f: {xf:.4f} | grad: {gn:.2f} | sigma: {adaptor.sigma:.4f} | div: {entry['diversity']:.4f}")
 
         # stability-gated auto-unfreezing
         if training_head_only:
