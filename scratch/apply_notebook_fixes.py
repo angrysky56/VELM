@@ -1,54 +1,40 @@
-#!/usr/bin/env python3
-# %%
 """
-VELM Colab Training — Single-file version for Google Colab or any GPU.
+Apply the comprehensive set of cell fixes to velm_colab.ipynb.
 
-Run all cells in order. Designed for T4 (free) through H100.
-Expected runtime: ~18 hours on T4, ~4 hours on H100.
+Run from VELM repo root:
+    .venv/bin/python scratch/apply_notebook_fixes.py
 
-Dataset:  OpenWebMath (streamed, ~1M tokens subset)
-Tokenizer: Qwen3.5 (248K vocab, 201 languages)
+A backup is taken automatically before writing.
 """
 
-# %% [markdown]
-# # VELM: Vector-Evolution Language Model — Training
-#
-# ## RUNBOOK: What to run and when
-#
-# **Fresh start (no checkpoints):** Run ALL cells 0→11 in order.
-#
-# **After Colab restart (AE already trained):**
-# 1. Run cells 0-4 (setup, imports, config, tokenizer, data) — always needed
-# 2. Skip cells 5, 6, 6.5 (AE training) — loads from Google Drive automatically
-# 3. Run cell 7 (Phase 2 setup) — creates **Mythos-Enhanced RDT** backbone+head
-# 4. Run cell 7.5 (teacher vectors) — loads from Drive if cached, else extracts
-# 5. Skip cell 7a (gradient training) — disabled, contradicts EGGROLL thesis
-# 6. Run cell 7b (EGGROLL) — **Atomic Resumption** supported; run to continue
-# 7. Run cells 9+ (GEA, evaluation) — optional
-#
-# **Mythos-Enhanced RDT Features (v1.1):**
-# - **LTI-Stable Injection**: Spectral radius $ρ(A) < 1$ prevents memory explosion.
-# - **Loop-Index Embeddings**: Sinusoidal awareness for reasoning depth.
-# - **Anchor Injection**: Original latent $e$ injected at every step for stability.
-# - **ACT Halting**: Learned halting probabilities (Experimental).
-#
-# **All artifacts persist to Google Drive automatically:**
-# - `VELM_checkpoints/calm_ae_best.eqx` — trained autoencoder
-# - `VELM_checkpoints/teacher_vectors.npy` — extracted teacher hidden states
-# - `VELM_checkpoints/backbone_stepX.eqx` — EGGROLL-trained backbone (checkpoints)
-# - `VELM_checkpoints/energy_head_stepX.eqx` — EGGROLL-trained energy head (checkpoints)
-#
-# **Phases:**
-# 1. Stream & tokenize OpenWebMath with Qwen3.5 tokenizer
-# 2. Train CALM autoencoder → >99.9% token reconstruction
-# 3. Extract teacher vectors from Qwen3.5-0.8B (cached to Drive)
-# 4. EGGROLL progressive unfreezing with **Mythos stability guarantees**
-# 5. GEA group evolution across task domains
-# 6. Evaluate: energy loss distributions, per-domain, cosine similarity
+from __future__ import annotations
 
-# %%
-# !pip install -q "jax[cuda12]" equinox jaxtyping optax einops tqdm datasets
-# !pip install -q "transformers>=5.6.2"
+import json
+import shutil
+import time
+from pathlib import Path
+
+NB = Path("notebooks/velm_colab.ipynb")
+BACKUP = Path(f"notebooks/velm_colab.ipynb.bak-{int(time.time())}")
+
+
+def code_cell(source: str) -> dict:
+    """Construct a code cell from a single source string."""
+    return {
+        "cell_type": "code",
+        "execution_count": None,
+        "metadata": {},
+        "outputs": [],
+        "source": source.splitlines(keepends=True),
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Cell 2 — bootstrap: pin transformers, fix corrupted drive.mount
+# ─────────────────────────────────────────────────────────────────────
+CELL_2 = """\
+!pip install -q "jax[cuda12]" equinox jaxtyping optax einops tqdm datasets
+!pip install -q "transformers>=5.6.2"
 
 import os, sys, json, shutil, time, glob
 os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
@@ -64,7 +50,7 @@ try:
     os.makedirs(DRIVE_DIR, exist_ok=True)
     os.makedirs("checkpoints", exist_ok=True)
     for f in os.listdir(DRIVE_DIR):
-        if (f.endswith('.eqx') or f.endswith('.json') or f.endswith('.npy')) \
+        if (f.endswith('.eqx') or f.endswith('.json') or f.endswith('.npy')) \\
            and not os.path.exists(f"checkpoints/{f}"):
             shutil.copy2(f"{DRIVE_DIR}/{f}", f"checkpoints/{f}")
     print(f"🚀 Google Drive mounted. Persistence enabled at {DRIVE_DIR}")
@@ -78,41 +64,19 @@ import jax.numpy as jnp
 import numpy as np
 import equinox as eqx
 print(f"JAX {jax.__version__} | backend: {jax.default_backend()} | devices: {jax.devices()}")
+"""
 
-
-# %% — 1. Clone repo & import VELM
-
-VELM_DIR = "/content/VELM" if os.path.exists("/content") else os.getcwd()
-if not os.path.exists(os.path.join(VELM_DIR, "src")):
-    os.system(
-        f"git clone https://github.com/angrysky56/VELM.git {VELM_DIR} 2>/dev/null"
-    )
-if os.path.exists(os.path.join(VELM_DIR, "src")):
-    os.chdir(VELM_DIR)
-    sys.path.insert(0, VELM_DIR)
-
-from src.model.autoencoder import (
-    CALMAutoencoder,
-    batch_ae_loss,
-    reconstruction_accuracy,
-)
-from src.model.config import CONFIGS, DEFAULT_TOKENIZER
-from src.model.energy_head import EnergyHead, energy_score
-from src.model.miras_backbone import VELMBackbone
-from src.training.eggroll import perturb_pytree  # used in Phase 2 custom ES loop
-
-print("✓ VELM modules imported")
-
-import time
-
-# %%
+# ─────────────────────────────────────────────────────────────────────
+# Cell 4 — hardware profile: add RTX 3060 (12 GB) tier
+# ─────────────────────────────────────────────────────────────────────
+CELL_4 = """\
 import equinox as eqx
 import numpy as np
 import optax
 
 
 def detect_hardware() -> dict:
-    """Pick training profile based on available GPU."""
+    \"\"\"Pick training profile based on available GPU.\"\"\"
     try:
         dev = jax.devices("gpu")[0]
         kind = dev.device_kind.lower()
@@ -147,16 +111,12 @@ K = cfg["chunk_size_k"]
 print(f"Hardware: {HW['name']} | Config: {CONFIG_NAME}")
 print(f"  AE steps: {HW['ae_steps']:,} | EGGROLL steps: {HW['egg_steps']:,}")
 print(f"  Target chunks: {HW['chunks']:,} ({HW['chunks']*K:,} tokens)")
+"""
 
-
-# %% — 3. Load Qwen3.5 tokenizer
-from transformers import AutoTokenizer
-
-tokenizer = AutoTokenizer.from_pretrained(DEFAULT_TOKENIZER, trust_remote_code=True)
-VOCAB_SIZE = len(tokenizer)
-print(f"Tokenizer: {DEFAULT_TOKENIZER}, vocab: {VOCAB_SIZE:,}")
-
-# %%
+# ─────────────────────────────────────────────────────────────────────
+# Cell 6 — data loading: fix the never-set all_chunks/num_chunks bug
+# ─────────────────────────────────────────────────────────────────────
+CELL_6 = """\
 DATA_CACHE_BIN = f"{DRIVE_DIR}/all_chunks.npy"
 DATA_CACHE_LABELS = f"{DRIVE_DIR}/chunk_labels.json"
 
@@ -235,7 +195,7 @@ else:
     label_counts: dict[str, int] = {}
     for lab in chunk_labels:
         label_counts[lab] = label_counts.get(lab, 0) + 1
-    print(f"\n✓ {num_chunks:,} chunks × K={K} = {num_chunks * K:,} tokens")
+    print(f"\\n✓ {num_chunks:,} chunks × K={K} = {num_chunks * K:,} tokens")
     for lab, cnt in sorted(label_counts.items()):
         print(f"  {lab}: {cnt:,} ({cnt / num_chunks:.0%})")
 
@@ -247,344 +207,13 @@ else:
 
 # host→device once: avoid per-step copy in tight training loops
 all_chunks_jnp = jnp.asarray(all_chunks)
+"""
 
-
-# %% — 5. Phase 1: Train CALM Autoencoder
-HIDDEN_DIM = cfg.get("ae_hidden_dim", 256)
-LATENT_DIM = cfg["latent_dim"]  # now 128 (was 64 — too tight for 248K vocab)
-FFN_DIM = cfg.get("ae_ffn_intermediate", 512)
-KL_CLIP = cfg.get("ae_kl_clip", 0.5)  # paper uses λ_KL=0.5
-KL_WEIGHT = cfg.get("ae_kl_weight", 0.001)  # paper uses β=0.001
-BATCH_SIZE = HW["batch"]
-AE_STEPS = HW["ae_steps"]
-LR = 3e-4
-
-key = jax.random.PRNGKey(42)
-k_init, key = jax.random.split(key)
-
-model = CALMAutoencoder(
-    vocab_size=VOCAB_SIZE,
-    chunk_size=K,
-    hidden_dim=HIDDEN_DIM,
-    latent_dim=LATENT_DIM,
-    ffn_intermediate=FFN_DIM,
-    kl_weight=KL_WEIGHT,
-    kl_clip=KL_CLIP,  # was 1.0 — paper says 0.5 prevents posterior collapse
-    key=k_init,
-)
-num_params = sum(x.size for x in jax.tree.leaves(eqx.filter(model, eqx.is_array)))
-print(f"Autoencoder: {num_params:,} params")
-print(f"  hidden={HIDDEN_DIM}, latent={LATENT_DIM}, K={K}, vocab={VOCAB_SIZE:,}")
-
-effective_warmup = min(500, max(AE_STEPS // 10, 1))
-schedule = optax.warmup_cosine_decay_schedule(
-    init_value=0.0,
-    peak_value=LR,
-    warmup_steps=effective_warmup,
-    decay_steps=AE_STEPS,
-    end_value=LR * 0.1,
-)
-optimizer = optax.chain(
-    optax.clip_by_global_norm(1.0),  # prevent gradient explosion → NaN
-    optax.adamw(schedule, weight_decay=0.01),
-)
-opt_state = optimizer.init(eqx.filter(model, eqx.is_array))
-
-
-@eqx.filter_jit
-def train_step(mdl, state, batch_chunk, key_step):
-    """JIT-compiled AE training step."""
-
-    def loss_fn(m):
-        return batch_ae_loss(m, batch_chunk, key=key_step)
-
-    (loss_val, metrics_val), grads = eqx.filter_value_and_grad(loss_fn, has_aux=True)(
-        mdl
-    )
-    updates, new_opt = optimizer.update(grads, state, mdl)
-    new_model = eqx.apply_updates(mdl, updates)
-    return new_model, new_opt, loss_val, metrics_val
-
-
-@eqx.filter_jit
-def eval_accuracy(mdl, batch_chunk):
-    """Compute token-level reconstruction accuracy limit."""
-    return reconstruction_accuracy(mdl, batch_chunk)
-
-
-# training loop
-print(f"\nPhase 1: AE training — {AE_STEPS:,} steps, batch={BATCH_SIZE}")
-print("=" * 60)
-
-history = {"loss": [], "recon": [], "kl": [], "accuracy": []}
-start_time = time.time()
-num_chunks = all_chunks.shape[0]
-best_acc = 0.0
-
-# Try restoring checkpoints from Google Drive first (Colab wipes local disk)
-if not os.path.exists("checkpoints/calm_ae_best.eqx"):
-    try:
-        from google.colab import drive  # noqa: E402
-
-        drive.mount("/content/drive", force_remount=False)
-        drive_dir = "/content/drive/MyDrive/VELM_checkpoints"
-        if os.path.isdir(drive_dir):
-            import shutil
-
-            os.makedirs("checkpoints", exist_ok=True)
-            for fname in os.listdir(drive_dir):
-                shutil.copy2(f"{drive_dir}/{fname}", f"checkpoints/{fname}")
-            print("  ✓ Restored checkpoints from Google Drive")
-    except (ImportError, FileNotFoundError, OSError):
-        pass  # Not on Colab or no Drive checkpoints
-
-SKIP_AE = False
-if os.path.exists("checkpoints/calm_ae_best.json") and os.path.exists(
-    "checkpoints/calm_ae_best.eqx"
-):
-    try:
-        import json
-
-        with open("checkpoints/calm_ae_best.json", "r", encoding="utf-8") as f:
-            meta = json.load(f)
-        if meta.get("accuracy", 0.0) >= 0.999:
-            print(
-                f"\n✓ Found fully trained AE checkpoint! (accuracy: {meta['accuracy']:.4%})"
-            )
-            print("  Skipping Phase 1 training.")
-            model = eqx.tree_deserialise_leaves("checkpoints/calm_ae_best.eqx", model)
-            SKIP_AE = True
-            best_acc = meta["accuracy"]
-            history["accuracy"].append(best_acc)
-    except Exception as e:
-        print("  Could not read checkpoint metadata, training normally:", e)
-
-if SKIP_AE:
-    AE_STEPS = 0  # Skip the loop entirely
-
-for step in range(1, AE_STEPS + 1):
-    key, batch_key, step_key = jax.random.split(key, 3)
-    indices = jax.random.randint(batch_key, (BATCH_SIZE,), 0, num_chunks)
-    batch = jnp.array(all_chunks[indices])
-    model, opt_state, loss, metrics = train_step(model, opt_state, batch, step_key)
-
-    if step % 500 == 0:
-        elapsed = time.time() - start_time
-        rl = float(metrics["recon_loss"])
-        kl = float(metrics["kl_loss"])
-        history["loss"].append(float(loss))
-        history["recon"].append(rl)
-        history["kl"].append(kl)
-        print(
-            f"  step {step:>6}/{AE_STEPS} | recon: {rl:.4f} | kl: {kl:.4f} | "
-            f"{step/elapsed:.1f} steps/s | {elapsed/60:.0f}m"
-        )
-
-    if step % 2000 == 0:
-        key, eval_key = jax.random.split(key)
-        eval_idx = jax.random.randint(eval_key, (512,), 0, num_chunks)
-        eval_batch = jnp.array(all_chunks[eval_idx])
-        acc = float(eval_accuracy(model, eval_batch))
-        history["accuracy"].append(acc)
-        print(f"  >> Reconstruction accuracy: {acc:.4%}")
-        if acc > best_acc:
-            best_acc = acc
-            os.makedirs("checkpoints", exist_ok=True)
-            eqx.tree_serialise_leaves("checkpoints/calm_ae_best.eqx", model)
-            import json
-
-            with open("checkpoints/calm_ae_best.json", "w", encoding="utf-8") as f:
-                json.dump(
-                    {
-                        "config": CONFIG_NAME,
-                        "vocab_size": VOCAB_SIZE,
-                        "tokenizer": DEFAULT_TOKENIZER,
-                        "step": step,
-                        "accuracy": acc,
-                    },
-                    f,
-                    indent=2,
-                )
-            print(f"  >> Saved best checkpoint (acc={acc:.4%})")
-        if acc > 0.999:
-            print(f"  ✅ TARGET >99.9% at step {step}! — stopping early")
-            break
-
-total_time = time.time() - start_time
-final_acc = history["accuracy"][-1] if history["accuracy"] else 0.0
-print(f"\nPhase 1 done: {total_time/3600:.2f}h | accuracy: {final_acc:.4%}")
-
-# save final
-eqx.tree_serialise_leaves("checkpoints/calm_ae_final.eqx", model)
-
-# persist to Google Drive (Colab disk is ephemeral!)
-try:
-    from google.colab import drive  # noqa: E402
-
-    drive.mount("/content/drive", force_remount=False)
-    drive_dir = "/content/drive/MyDrive/VELM_checkpoints"
-    os.makedirs(drive_dir, exist_ok=True)
-    import shutil
-
-    for f in ["calm_ae_best.eqx", "calm_ae_best.json", "calm_ae_final.eqx"]:
-        src = f"checkpoints/{f}"
-        if os.path.exists(src):
-            shutil.copy2(src, f"{drive_dir}/{f}")
-    print(f"✓ Checkpoints backed up to Google Drive: {drive_dir}")
-except ImportError:
-    print("Not on Colab — checkpoints are in ./checkpoints/")
-
-# %% — 6. Plot AE training curves
-import matplotlib
-
-matplotlib.use("Agg")  # headless
-import matplotlib.pyplot as plt
-
-fig, axes = plt.subplots(1, 3, figsize=(15, 4))
-axes[0].plot(history["recon"])
-axes[0].set_title("Recon Loss")
-axes[0].set_xlabel("×500 steps")
-axes[1].plot(history["kl"])
-axes[1].set_title("KL Loss")
-axes[1].set_xlabel("×500 steps")
-axes[2].plot(history["accuracy"])
-axes[2].axhline(y=0.999, color="r", linestyle="--", label="99.9% target")
-axes[2].set_title("Reconstruction Acc")
-axes[2].set_xlabel("×2000 steps")
-axes[2].legend()
-plt.tight_layout()
-plt.savefig("ae_training_curves.png", dpi=150, bbox_inches="tight")
-print("Saved: ae_training_curves.png")
-try:
-    plt.show()
-except Exception:  # pylint: disable=broad-except
-    pass
-
-# %% — 6.5. Phase 1.5: Continue AE Training (warm restart)
-# Skip this cell if Phase 1 already hit >99.9%.
-# Otherwise, load the best checkpoint and continue with a fresh LR schedule.
-# The model was still improving at 100K steps — more training helps.
-
-CONTINUE_AE = True  # set False to skip continuation
-CONTINUE_STEPS = 100_000
-CONTINUE_LR = 1e-4  # lower peak than Phase 1 (was 3e-4)
-TARGET_ACC = 0.999  # stop when we hit this
-
-if CONTINUE_AE and best_acc < TARGET_ACC:
-    print(f"\nPhase 1.5: Continue AE training — best so far: {best_acc:.4%}")
-    print(
-        f"  Loading best checkpoint, {CONTINUE_STEPS:,} more steps, peak LR={CONTINUE_LR}"
-    )
-    print("=" * 60)
-
-    # load best checkpoint
-    model = eqx.tree_deserialise_leaves("checkpoints/calm_ae_best.eqx", model)
-    print(f"  ✓ Loaded best checkpoint (acc={best_acc:.4%})")
-
-    # fresh optimizer with lower LR and longer warmup
-    cont_warmup = min(1000, CONTINUE_STEPS // 10)
-    cont_schedule = optax.warmup_cosine_decay_schedule(
-        init_value=0.0,
-        peak_value=CONTINUE_LR,
-        warmup_steps=cont_warmup,
-        decay_steps=CONTINUE_STEPS,
-        end_value=CONTINUE_LR * 0.01,  # decay to 1e-6
-    )
-    cont_optimizer = optax.chain(
-        optax.clip_by_global_norm(1.0),
-        optax.adamw(cont_schedule, weight_decay=0.01),
-    )
-    opt_state = cont_optimizer.init(eqx.filter(model, eqx.is_array))
-
-    # redefine train_step with the new optimizer
-    @eqx.filter_jit
-    def cont_train_step(mdl, state, batch_chunk, key_step):
-        def loss_fn(m):
-            return batch_ae_loss(m, batch_chunk, key=key_step)
-
-        (loss_val, metrics_val), grads = eqx.filter_value_and_grad(
-            loss_fn, has_aux=True
-        )(mdl)
-        updates, new_opt = cont_optimizer.update(grads, state, mdl)
-        new_model = eqx.apply_updates(mdl, updates)
-        return new_model, new_opt, loss_val, metrics_val
-
-    cont_history = {"recon": [], "kl": [], "accuracy": []}
-    cont_start = time.time()
-    hit_target = False
-
-    for step in range(1, CONTINUE_STEPS + 1):
-        key, batch_key, step_key = jax.random.split(key, 3)
-        indices = jax.random.randint(batch_key, (BATCH_SIZE,), 0, num_chunks)
-        batch = jnp.array(all_chunks[indices])
-        model, opt_state, loss, metrics = cont_train_step(
-            model, opt_state, batch, step_key
-        )
-
-        if step % 500 == 0:
-            elapsed = time.time() - cont_start
-            rl = float(metrics["recon_loss"])
-            kl = float(metrics["kl_loss"])
-            cont_history["recon"].append(rl)
-            cont_history["kl"].append(kl)
-            print(
-                f"  step {step:>6}/{CONTINUE_STEPS} | recon: {rl:.4f} | "
-                f"kl: {kl:.4f} | {step/elapsed:.1f} steps/s | "
-                f"{elapsed/60:.0f}m"
-            )
-
-        if step % 2000 == 0:
-            key, eval_key = jax.random.split(key)
-            eval_idx = jax.random.randint(eval_key, (512,), 0, num_chunks)
-            eval_batch = jnp.array(all_chunks[eval_idx])
-            acc = float(eval_accuracy(model, eval_batch))
-            cont_history["accuracy"].append(acc)
-            print(f"  >> Reconstruction accuracy: {acc:.4%}")
-            if acc > best_acc:
-                best_acc = acc
-                eqx.tree_serialise_leaves("checkpoints/calm_ae_best.eqx", model)
-                import json
-
-                with open("checkpoints/calm_ae_best.json", "w", encoding="utf-8") as f:
-                    json.dump(
-                        {
-                            "config": CONFIG_NAME,
-                            "vocab_size": VOCAB_SIZE,
-                            "tokenizer": DEFAULT_TOKENIZER,
-                            "step": 100_000 + step,
-                            "accuracy": acc,
-                            "phase": "1.5_continuation",
-                        },
-                        f,
-                        indent=2,
-                    )
-                print(f"  >> New best! Saved checkpoint (acc={acc:.4%})")
-            if acc >= TARGET_ACC:
-                print(f"  🎯 TARGET {TARGET_ACC:.1%} reached at step {step}!")
-                hit_target = True
-                break
-
-            # plateau detection: if no improvement in last 5 evals, stop
-            if len(cont_history["accuracy"]) >= 6:
-                last_5 = cont_history["accuracy"][-5:]
-                if max(last_5) - min(last_5) < 0.001:
-                    print(f"  ⚠ Plateau detected (last 5 evals within 0.1%)")
-                    print(f"    Consider increasing hidden_dim to 384 or 512")
-                    break
-
-    cont_elapsed = time.time() - cont_start
-    eqx.tree_serialise_leaves("checkpoints/calm_ae_final.eqx", model)
-    print(f"\nPhase 1.5 done: {cont_elapsed/3600:.2f}h | best accuracy: {best_acc:.4%}")
-    if not hit_target and best_acc < TARGET_ACC:
-        print(f"  ⚠ Did not reach {TARGET_ACC:.1%}. The hidden_dim=256 may be too")
-        print(f"    small for 248K vocab. Set hidden_dim=384 in config and retrain.")
-else:
-    if best_acc >= TARGET_ACC:
-        print(f"\n✓ AE already at {best_acc:.4%} — skipping Phase 1.5")
-    else:
-        print(f"\n⏭ Phase 1.5 skipped (CONTINUE_AE=False)")
-
-# %%
+# ─────────────────────────────────────────────────────────────────────
+# Cell 10 — backbone init + AE load: fix the corrupted noqa-eaten lines
+# (this cell mostly OK; just patch the broken FileNotFoundError text)
+# ─────────────────────────────────────────────────────────────────────
+CELL_10 = """\
 # Re-derive AE dimensions from config (in case Phase 1 cells were skipped)
 HIDDEN_DIM = cfg.get("ae_hidden_dim", 256)
 LATENT_DIM = cfg["latent_dim"]
@@ -657,9 +286,13 @@ if "model" not in dir() or model is None:
     model = eqx.tree_deserialise_leaves(ckpt_path, model)
     print(f"  ✓ Loaded: {ckpt_path}")
 frozen_ae = model
+"""
 
-
-# %%
+# ─────────────────────────────────────────────────────────────────────
+# Cell 11 — teacher vectors + setup: fix corrupted noqa, drop the
+# broken in-cell evaluate_params (replaced by velm_fitness module)
+# ─────────────────────────────────────────────────────────────────────
+CELL_11 = """\
 # Extract teacher hidden states (Qwen3.5) and cache them.
 # Cell 2 already restored teacher_vectors.npy from Drive if present.
 
@@ -677,7 +310,7 @@ if not _loaded_teacher:
     from tqdm import tqdm
     from transformers import AutoModelForCausalLM
 
-    print(f"\nExtracting teacher vectors from {DEFAULT_TOKENIZER}...")
+    print(f"\\nExtracting teacher vectors from {DEFAULT_TOKENIZER}...")
     teacher_device = "cuda" if torch.cuda.is_available() else "cpu"
     teacher_model = AutoModelForCausalLM.from_pretrained(
         DEFAULT_TOKENIZER,
@@ -734,9 +367,13 @@ from src.training.distillation import TeacherProjection  # noqa: E402
 k_proj, key = jax.random.split(key)
 teacher_proj = TeacherProjection(TEACHER_DIM, cfg["hidden_dim"], key=k_proj)
 _tp_static = eqx.filter(teacher_proj, lambda x: not eqx.is_array(x))
+"""
 
-
-# %%
+# ─────────────────────────────────────────────────────────────────────
+# Cell 12 — Phase 2a (gradient + distillation, currently disabled)
+# Was 200+ lines of dead code. Collapse to a one-line skip notice.
+# ─────────────────────────────────────────────────────────────────────
+CELL_12 = """\
 # Phase 2a (gradient + teacher distillation) is intentionally DISABLED.
 #
 # The project's thesis is gradient-free training via EGGROLL — using
@@ -745,9 +382,13 @@ _tp_static = eqx.filter(teacher_proj, lambda x: not eqx.is_array(x))
 # the notebook flow goes straight from Phase 1 (AE) → Phase 2 (EGGROLL).
 USE_GRADIENT_PHASE = False
 print("Phase 2a (gradient distillation): SKIPPED — proceeding to EGGROLL.")
+"""
 
-
-# %%
+# ─────────────────────────────────────────────────────────────────────
+# Cell 13 — THE BIG ONE: replace hand-rolled EGGROLL loop with
+# JIT-compiled factory from src/training/velm_fitness.py
+# ─────────────────────────────────────────────────────────────────────
+CELL_13 = """\
 # Phase 2: EGGROLL training with progressive head-only → full unfreeze.
 #
 # Uses the JIT-compiled antithetic ES step from src/training/velm_fitness.
@@ -834,7 +475,7 @@ for step in range(RESUME_STEP + 1, EGGROLL_STEPS + 1):
         if not already_unfrozen:
             already_unfrozen = True
             full_opt_state = full_opt.init(trainable)  # fresh state on transition
-            print(f"\n  >>> Unfreezing backbone at step {step} <<<\n")
+            print(f"\\n  >>> Unfreezing backbone at step {step} <<<\\n")
         trainable, full_opt_state, m = step_full(
             trainable, full_opt_state, batch, step_key, sigma_jax,
         )
@@ -871,7 +512,7 @@ for step in range(RESUME_STEP + 1, EGGROLL_STEPS + 1):
             if len(recent) == UNFREEZE_WINDOW:
                 rel = (max(recent) - min(recent)) / (abs(min(recent)) + 1e-8)
                 if rel < UNFREEZE_PLATEAU:
-                    print(f"\n  🔓 head-only fitness plateaued (Δ={rel:.4f}) — unfreezing now\n")
+                    print(f"\\n  🔓 head-only fitness plateaued (Δ={rel:.4f}) — unfreezing now\\n")
                     already_unfrozen = True
                     full_opt_state = full_opt.init(trainable)
 
@@ -882,14 +523,14 @@ for step in range(RESUME_STEP + 1, EGGROLL_STEPS + 1):
             if len(recent) >= CONVERGENCE_WINDOW // 2:
                 rel = (max(recent) - min(recent)) / (abs(min(recent)) + 1e-8)
                 if rel < CONVERGENCE_PLATEAU:
-                    print(f"\n  🎯 full-model converged (Δ={rel:.4f}) — stopping early")
+                    print(f"\\n  🎯 full-model converged (Δ={rel:.4f}) — stopping early")
                     break
 
         # divergence guard
         if len(egg_history["mean_fitness"]) >= 5:
             tail = [v for v in egg_history["mean_fitness"][-5:] if v == v]
             if len(tail) >= 2 and tail[-1] < min(tail[:-1]) * 10:
-                print(f"\n  ⚠ DIVERGENCE at step {step} — stopping EGGROLL")
+                print(f"\\n  ⚠ DIVERGENCE at step {step} — stopping EGGROLL")
                 break
 
     # checkpoint every 500 steps
@@ -905,7 +546,7 @@ for step in range(RESUME_STEP + 1, EGGROLL_STEPS + 1):
             shutil.copy2(hd_ckpt, f"{DRIVE_DIR}/head_step{step}.eqx")
 
 elapsed = time.time() - start
-print(f"\nPhase 2 done: {elapsed/3600:.2f}h")
+print(f"\\nPhase 2 done: {elapsed/3600:.2f}h")
 
 # Final save of best params
 final_bb = eqx.combine(trainable["backbone"], _bb_static)
@@ -923,9 +564,12 @@ with open("checkpoints/backbone_meta.json", "w", encoding="utf-8") as f:
         "history": egg_history,
     }, f, indent=2)
 print("✓ Saved: checkpoints/backbone_eggroll.eqx + energy_head_eggroll.eqx + meta.json")
+"""
 
-
-# %%
+# ─────────────────────────────────────────────────────────────────────
+# Cell 14 — plot: now that egg_history is populated, this works
+# ─────────────────────────────────────────────────────────────────────
+CELL_14 = """\
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -987,57 +631,12 @@ try:
     plt.show()
 except Exception:
     pass
+"""
 
-
-# %% — 8.5. EGGROLL Diagnostics Report
-print("Diagnostics were tracked and logged during the EGGROLL training loop.")
-
-try:
-    diag.report()
-    if diag.warnings:
-        print("\n⚠ Active warnings:")
-        for w in diag.warnings:
-            print(f"  - {w}")
-except NameError:
-    print("Diagnostics not available. Please run the EGGROLL training cell first.")
-
-# %% [markdown]
-# ### 🔄 Resume Checkpoint (Run this to skip Phase 2)
-# Run this cell after restarting Colab to load the Phase 2 EGGROLL checkpoints into memory. This allows you to skip the 15-hour training and proceed directly to Phase 3 or Evaluation.
-
-# %%
-import equinox as eqx
-import os
-
-bb_path = "checkpoints/backbone_eggroll.eqx"
-hd_path = "checkpoints/energy_head_eggroll.eqx"
-
-# Check if we need to copy from Drive first
-if not os.path.exists(bb_path):
-    try:
-        import shutil
-        drive_dir = "/content/drive/MyDrive/VELM_checkpoints"
-        os.makedirs("checkpoints", exist_ok=True)
-        if os.path.exists(f"{drive_dir}/backbone_eggroll.eqx"):
-            shutil.copy2(f"{drive_dir}/backbone_eggroll.eqx", bb_path)
-            shutil.copy2(f"{drive_dir}/energy_head_eggroll.eqx", hd_path)
-            print("Restored EGGROLL checkpoints from Google Drive.")
-    except Exception:
-        pass
-
-if os.path.exists(bb_path) and os.path.exists(hd_path):
-    print("Loading EGGROLL trained parameters into memory...")
-    trainable["backbone"] = eqx.tree_deserialise_leaves(bb_path, trainable["backbone"])
-    trainable["head"] = eqx.tree_deserialise_leaves(hd_path, trainable["head"])
-
-    # Prepare final_bb and final_hd so Evaluation works even if Phase 3 is skipped
-    final_bb = eqx.combine(trainable["backbone"], _bb_static)
-    final_hd = eqx.combine(trainable["head"], _hd_static)
-    print("\u2713 Successfully loaded 15-hour EGGROLL checkpoints! You can now run Evaluation.")
-else:
-    print("\u26a0 EGGROLL checkpoints not found locally or in Drive. You may need to train first.")
-
-# %%
+# ─────────────────────────────────────────────────────────────────────
+# Cell 18 — GEA Phase 3: use JIT-compiled fitness eval, real keys
+# ─────────────────────────────────────────────────────────────────────
+CELL_18 = """\
 from src.evolution.gea_eggroll import (  # noqa: E402
     GroupEvolver,
     experience_weighted_eggroll_step,
@@ -1050,7 +649,7 @@ GEA_GROUP = 5
 GEA_SIGMA = SIGMA
 GEA_BIAS = 0.3
 
-print(f"\nPhase 3: GEA Group Evolution — {GEA_ITERATIONS} iterations")
+print(f"\\nPhase 3: GEA Group Evolution — {GEA_ITERATIONS} iterations")
 print(f"  population: {GEA_POP} | group: {GEA_GROUP} | σ: {GEA_SIGMA}")
 print("=" * 60)
 
@@ -1073,7 +672,7 @@ gea_eval = make_velm_fitness_eval(frozen_ae, _bb_static, _hd_static, num_samples
 
 
 def gea_fitness_fn(params, task):
-    """Evaluate one perturbed candidate on one task domain."""
+    \"\"\"Evaluate one perturbed candidate on one task domain.\"\"\"
     task_type = task.get("type", "default")
     domain_idx = domain_indices.get(task_type, [])
     if domain_idx:
@@ -1128,7 +727,7 @@ for gea_iter in range(1, GEA_ITERATIONS + 1):
     print(f"  GEA {gea_iter:>3}/{GEA_ITERATIONS} | mean: {mf:.4f} | "
           f"best: {xf:.4f} | parents: {len(unique_parents)} | {elapsed/60:.0f}m")
 
-print(f"\nPhase 3 done: {(time.time()-gea_start)/60:.1f}m")
+print(f"\\nPhase 3 done: {(time.time()-gea_start)/60:.1f}m")
 
 final_bb = eqx.combine(trainable["backbone"], _bb_static)
 final_hd = eqx.combine(trainable["head"], _hd_static)
@@ -1138,29 +737,13 @@ if DRIVE_DIR != "checkpoints":
     shutil.copy2("checkpoints/backbone_gea.eqx", f"{DRIVE_DIR}/backbone_gea.eqx")
     shutil.copy2("checkpoints/energy_head_gea.eqx", f"{DRIVE_DIR}/energy_head_gea.eqx")
 print("✓ Saved: backbone_gea.eqx + energy_head_gea.eqx")
+"""
 
-
-# %% — 9.5. Plot GEA evolution curves
-fig, axes = plt.subplots(1, 2, figsize=(12, 4))
-axes[0].plot(gea_history["mean_fitness"], label="mean", marker="o")
-axes[0].plot(gea_history["max_fitness"], label="best", marker="s")
-axes[0].set_title("GEA Fitness Over Iterations")
-axes[0].set_xlabel("GEA Iteration")
-axes[0].legend()
-axes[1].bar(range(len(gea_history["parent_sizes"])), gea_history["parent_sizes"])
-axes[1].set_title("Unique Parents Per Iteration")
-axes[1].set_xlabel("GEA Iteration")
-axes[1].set_ylabel("# Parents")
-plt.tight_layout()
-plt.savefig("gea_evolution.png", dpi=150, bbox_inches="tight")
-print("Saved: gea_evolution.png")
-try:
-    plt.show()
-except Exception:  # pylint: disable=broad-except
-    pass
-
-# %%
-print("\n" + "=" * 60)
+# ─────────────────────────────────────────────────────────────────────
+# Cell 20 — final evaluation: fix off-by-one bug
+# ─────────────────────────────────────────────────────────────────────
+CELL_20 = """\
+print("\\n" + "=" * 60)
 print("Evaluation")
 print("=" * 60)
 
@@ -1171,7 +754,7 @@ eval_batch = all_chunks_jnp[eval_idx]
 final_acc = float(eval_accuracy(frozen_ae, eval_batch))
 print(f"AE reconstruction accuracy (1000 chunks): {final_acc:.4%}")
 
-print("\nSample reconstructions (original → reconstructed):")
+print("\\nSample reconstructions (original → reconstructed):")
 for i in range(5):
     original = all_chunks[i]
     original_text = tokenizer.decode(original.tolist())
@@ -1181,7 +764,7 @@ for i in range(5):
     print(f"  {match_char} [{original_text[:40]:>40s}] → [{recon_text[:40]:<40s}]")
 
 # Backbone next-vector prediction: energy loss DISTRIBUTION
-print("\n— Energy Loss Distribution (500 pairs) —")
+print("\\n— Energy Loss Distribution (500 pairs) —")
 key, pred_key = jax.random.split(key)
 N_EVAL = 500
 test_idx = jax.random.randint(pred_key, (N_EVAL,), 0, num_chunks)
@@ -1214,7 +797,7 @@ if len(finite_losses) > 0:
     print(f"  Std:    {np.std(finite_losses):.4f}")
 
 # Per-domain breakdown — FIX: was [:len(losses_np)+1] → off-by-one
-print("\n— Per-Domain Energy Loss —")
+print("\\n— Per-Domain Energy Loss —")
 test_labels = [chunk_labels[int(idx)] for idx in test_idx[:len(losses_np)]]
 domain_losses: dict[str, list] = {}
 # losses array maps to pairs (i, i+1); we use shifted labels so loss_i pairs to label_{i+1}
@@ -1229,7 +812,7 @@ for lab in sorted(domain_losses):
     print(f"  {lab:>12s}: mean={np.mean(vals):.4f} std={np.std(vals):.4f} n={len(vals)}")
 
 # Cosine similarity between predictions and targets
-print("\n— Prediction-Target Cosine Similarity —")
+print("\\n— Prediction-Target Cosine Similarity —")
 def cos_sim(h, z_t, k):
     pred = final_hd.predict(h, key=k)
     p_n = pred / (jnp.linalg.norm(pred) + 1e-8)
@@ -1246,7 +829,7 @@ if len(finite_sims) > 0:
     print(f"  P5/P95:     {pcts_s[0]:.4f} / {pcts_s[4]:.4f}")
 
 # Miras memory state norm sanity check
-print("\n— Miras Memory State Norms —")
+print("\\n— Miras Memory State Norms —")
 for i, block in enumerate(final_bb.miras_blocks):
     cap = float(block.miras.frobenius_capacity)
     print(f"  Layer {i}: frobenius_capacity = {cap:.1f}")
@@ -1275,54 +858,55 @@ axes[2].set_title("Energy Loss by Domain"); axes[2].set_ylabel("Mean Energy Loss
 
 plt.tight_layout()
 plt.savefig("evaluation_distributions.png", dpi=150, bbox_inches="tight")
-print("\nSaved: evaluation_distributions.png")
+print("\\nSaved: evaluation_distributions.png")
 try:
     plt.show()
 except Exception:
     pass
+"""
+
+# ─────────────────────────────────────────────────────────────────────
+# Apply edits
+# ─────────────────────────────────────────────────────────────────────
+EDITS: dict[int, str] = {
+    2: CELL_2,
+    4: CELL_4,
+    6: CELL_6,
+    10: CELL_10,
+    11: CELL_11,
+    12: CELL_12,
+    13: CELL_13,
+    14: CELL_14,
+    18: CELL_18,
+    20: CELL_20,
+}
 
 
-# %% — 11. Summary & Download
-print("\n" + "=" * 60)
-print("✅ VELM Training Complete!")
-print("=" * 60)
-print(f"Config:      {CONFIG_NAME}")
-print(f"Tokenizer:   {DEFAULT_TOKENIZER} (vocab={VOCAB_SIZE:,})")
-print(f"Dataset:     {num_chunks:,} chunks across {len(set(chunk_labels)):,} domains")
-print(f"AE accuracy: {final_acc:.4%}")
-print(f"GEA iters:   {GEA_ITERATIONS} (bias={GEA_BIAS})")
-print("\nCheckpoints saved:")
-print("  checkpoints/backbone_grad.eqx      — gradient backbone (if used)")
-print("  checkpoints/energy_head_grad.eqx   — gradient head (if used)")
-print("  checkpoints/backbone_eggroll.eqx   — EGGROLL backbone")
-print("  checkpoints/energy_head_eggroll.eqx — energy head (EGGROLL)")
-print("  checkpoints/backbone_gea.eqx       — GEA-evolved backbone")
-print("  checkpoints/energy_head_gea.eqx    — GEA-evolved energy head")
-print("  checkpoints/*.json                 — metadata for loading")
-print("\nTraining curves:")
-print("  ae_training_curves.png")
-print("  eggroll_training.png")
-print("  gea_evolution.png")
-print("  evaluation_distributions.png")
+def main() -> None:
+    if not NB.exists():
+        raise SystemExit(f"Notebook not found: {NB}")
 
-# Colab download helper
-try:
-    from google.colab import files  # noqa: E402
+    # belt-and-suspenders backup
+    shutil.copy2(NB, BACKUP)
+    print(f"📦 Backup: {BACKUP}")
 
-    for f in [
-        "checkpoints/calm_ae_best.eqx",
-        "checkpoints/calm_ae_best.json",
-        "checkpoints/backbone_eggroll.eqx",
-        "checkpoints/energy_head_eggroll.eqx",
-        "checkpoints/backbone_gea.eqx",
-        "checkpoints/energy_head_gea.eqx",
-        "checkpoints/backbone_meta.json",
-        "ae_training_curves.png",
-        "eggroll_training.png",
-        "gea_evolution.png",
-        "evaluation_distributions.png",
-    ]:
-        if os.path.exists(f):
-            files.download(f)
-except ImportError:
-    print("\nNot on Colab — checkpoints are in ./checkpoints/")
+    nb = json.loads(NB.read_text())
+    cells = nb["cells"]
+    if len(cells) != 22:
+        print(f"⚠ Expected 22 cells, got {len(cells)}. Aborting to be safe.")
+        raise SystemExit(1)
+
+    for idx, source in EDITS.items():
+        old_len = len("".join(cells[idx]["source"]))
+        cells[idx] = code_cell(source)
+        new_len = len("".join(cells[idx]["source"]))
+        delta = new_len - old_len
+        sign = "+" if delta >= 0 else ""
+        print(f"  cell [{idx:2}] : {old_len:>6}c → {new_len:>6}c  ({sign}{delta:+d})")
+
+    NB.write_text(json.dumps(nb, indent=1))
+    print(f"✓ Wrote {NB} ({sum(len(json.dumps(c)) for c in cells)} bytes serialized)")
+
+
+if __name__ == "__main__":
+    main()
