@@ -103,11 +103,7 @@ from src.training.eggroll import perturb_pytree  # used in Phase 2 custom ES loo
 
 print("✓ VELM modules imported")
 
-import time
-
 # %%
-import equinox as eqx
-import numpy as np
 import optax
 
 
@@ -391,7 +387,7 @@ for step in range(1, AE_STEPS + 1):
             best_acc = acc
             os.makedirs("checkpoints", exist_ok=True)
             eqx.tree_serialise_leaves("checkpoints/calm_ae_best.eqx", model)
-            import json
+
 
             with open("checkpoints/calm_ae_best.json", "w", encoding="utf-8") as f:
                 json.dump(
@@ -543,7 +539,7 @@ if CONTINUE_AE and best_acc < TARGET_ACC:
             if acc > best_acc:
                 best_acc = acc
                 eqx.tree_serialise_leaves("checkpoints/calm_ae_best.eqx", model)
-                import json
+
 
                 with open("checkpoints/calm_ae_best.json", "w", encoding="utf-8") as f:
                     json.dump(
@@ -761,7 +757,7 @@ from src.training.eggroll import SigmaAdaptor
 from src.training.velm_fitness import make_velm_eggroll_step
 
 diag = EGGROLLDiagnostics(plateau_window=50, plateau_threshold=0.001)
-adaptor = SigmaAdaptor(initial_sigma=SIGMA, target_diversity=0.02)
+adaptor = SigmaAdaptor(initial_sigma=SIGMA, target_diversity=0.02, max_sigma=0.01)
 
 # History buffers — fed into the plot cell and convergence checks.
 egg_history = {
@@ -771,14 +767,14 @@ egg_history = {
 
 # Two compiled step functions: head-only (rank=1, fast warmup) and full
 # (rank=2, lower LR). Each compiles once and is reused for the whole phase.
-head_opt = optax.chain(optax.clip_by_global_norm(1.0), optax.adam(EGG_LR))
+head_opt = optax.chain(optax.clip_by_global_norm(1.0), optax.adamw(EGG_LR, weight_decay=0.01))
 head_opt_state = head_opt.init({"head": trainable["head"]})
 step_head = make_velm_eggroll_step(
     frozen_ae, _bb_static, _hd_static, head_opt,
     pop_size=POP_SIZE, rank=1, num_samples=8, perturb_head_only=True,
 )
 
-full_opt = optax.chain(optax.clip_by_global_norm(1.0), optax.adam(EGG_LR * 0.3))
+full_opt = optax.chain(optax.clip_by_global_norm(1.0), optax.adamw(EGG_LR * 0.3, weight_decay=0.01))
 full_opt_state = full_opt.init(trainable)
 step_full = make_velm_eggroll_step(
     frozen_ae, _bb_static, _hd_static, full_opt,
@@ -793,10 +789,19 @@ if existing:
     latest = existing[-1]
     RESUME_STEP = int(latest.rsplit("step", 1)[1].rsplit(".", 1)[0])
     print(f"🔄 Resuming EGGROLL from step {RESUME_STEP} ({latest})")
-    trainable["backbone"] = eqx.tree_deserialise_leaves(latest, trainable["backbone"])
+    try:
+        trainable["backbone"] = eqx.tree_deserialise_leaves(latest, trainable["backbone"])
+    except RuntimeError:
+        _tmp = eqx.tree_deserialise_leaves(latest, eqx.combine(trainable["backbone"], _bb_static))
+        trainable["backbone"] = eqx.filter(_tmp, eqx.is_array)
+        print("  (loaded old-format combined checkpoint)")
     hd_ckpt = latest.replace("backbone", "head")
     if os.path.exists(hd_ckpt):
-        trainable["head"] = eqx.tree_deserialise_leaves(hd_ckpt, trainable["head"])
+        try:
+            trainable["head"] = eqx.tree_deserialise_leaves(hd_ckpt, trainable["head"])
+        except RuntimeError:
+            _tmp = eqx.tree_deserialise_leaves(hd_ckpt, eqx.combine(trainable["head"], _hd_static))
+            trainable["head"] = eqx.filter(_tmp, eqx.is_array)
     # re-init opt states after loading params
     head_opt_state = head_opt.init({"head": trainable["head"]})
     full_opt_state = full_opt.init(trainable)
@@ -844,6 +849,12 @@ for step in range(RESUME_STEP + 1, EGGROLL_STEPS + 1):
     if step % 100 == 0:
         mf = float(m["mean_fitness"]); xf = float(m["max_fitness"])
         fs = float(m["fitness_std"]);  gn = float(m["grad_norm"])
+
+        # NaN guard: stop if fitness went non-finite
+        if not (np.isfinite(mf) and np.isfinite(gn)):
+            print(f"\n  ⚠ NaN/Inf detected at step {step} — stopping EGGROLL")
+            break
+
         entry = diag.log_step(step, trainable, {
             "mean_fitness": mf, "max_fitness": xf,
             "fitness_std": fs, "grad_norm": gn,
@@ -892,14 +903,12 @@ for step in range(RESUME_STEP + 1, EGGROLL_STEPS + 1):
                 print(f"\n  ⚠ DIVERGENCE at step {step} — stopping EGGROLL")
                 break
 
-    # checkpoint every 500 steps
+    # checkpoint every 500 steps (save filtered arrays — must match resume tree)
     if step % 500 == 0:
-        ckpt_bb = eqx.combine(trainable["backbone"], _bb_static)
-        ckpt_hd = eqx.combine(trainable["head"], _hd_static)
         bb_ckpt = f"checkpoints/backbone_step{step}.eqx"
         hd_ckpt = f"checkpoints/head_step{step}.eqx"
-        eqx.tree_serialise_leaves(bb_ckpt, ckpt_bb)
-        eqx.tree_serialise_leaves(hd_ckpt, ckpt_hd)
+        eqx.tree_serialise_leaves(bb_ckpt, trainable["backbone"])
+        eqx.tree_serialise_leaves(hd_ckpt, trainable["head"])
         if DRIVE_DIR != "checkpoints":
             shutil.copy2(bb_ckpt, f"{DRIVE_DIR}/backbone_step{step}.eqx")
             shutil.copy2(hd_ckpt, f"{DRIVE_DIR}/head_step{step}.eqx")
@@ -907,11 +916,11 @@ for step in range(RESUME_STEP + 1, EGGROLL_STEPS + 1):
 elapsed = time.time() - start
 print(f"\nPhase 2 done: {elapsed/3600:.2f}h")
 
-# Final save of best params
+# Final save of best params (filtered arrays — matches resume tree structure)
 final_bb = eqx.combine(trainable["backbone"], _bb_static)
 final_hd = eqx.combine(trainable["head"], _hd_static)
-eqx.tree_serialise_leaves("checkpoints/backbone_eggroll.eqx", final_bb)
-eqx.tree_serialise_leaves("checkpoints/energy_head_eggroll.eqx", final_hd)
+eqx.tree_serialise_leaves("checkpoints/backbone_eggroll.eqx", trainable["backbone"])
+eqx.tree_serialise_leaves("checkpoints/energy_head_eggroll.eqx", trainable["head"])
 if DRIVE_DIR != "checkpoints":
     shutil.copy2("checkpoints/backbone_eggroll.eqx", f"{DRIVE_DIR}/backbone_eggroll.eqx")
     shutil.copy2("checkpoints/energy_head_eggroll.eqx", f"{DRIVE_DIR}/energy_head_eggroll.eqx")
@@ -987,6 +996,7 @@ try:
     plt.show()
 except Exception:
     pass
+plt.close(fig)
 
 
 # %% — 8.5. EGGROLL Diagnostics Report
@@ -1027,8 +1037,17 @@ if not os.path.exists(bb_path):
 
 if os.path.exists(bb_path) and os.path.exists(hd_path):
     print("Loading EGGROLL trained parameters into memory...")
-    trainable["backbone"] = eqx.tree_deserialise_leaves(bb_path, trainable["backbone"])
-    trainable["head"] = eqx.tree_deserialise_leaves(hd_path, trainable["head"])
+    try:
+        trainable["backbone"] = eqx.tree_deserialise_leaves(bb_path, trainable["backbone"])
+    except RuntimeError:
+        print("  Old-format checkpoint detected, loading via full module...")
+        _tmp_bb = eqx.tree_deserialise_leaves(bb_path, eqx.combine(trainable["backbone"], _bb_static))
+        trainable["backbone"] = eqx.filter(_tmp_bb, eqx.is_array)
+    try:
+        trainable["head"] = eqx.tree_deserialise_leaves(hd_path, trainable["head"])
+    except RuntimeError:
+        _tmp_hd = eqx.tree_deserialise_leaves(hd_path, eqx.combine(trainable["head"], _hd_static))
+        trainable["head"] = eqx.filter(_tmp_hd, eqx.is_array)
 
     # Prepare final_bb and final_hd so Evaluation works even if Phase 3 is skipped
     final_bb = eqx.combine(trainable["backbone"], _bb_static)
@@ -1077,8 +1096,10 @@ def gea_fitness_fn(params, task):
     task_type = task.get("type", "default")
     domain_idx = domain_indices.get(task_type, [])
     if domain_idx:
-        # take a deterministic sample for reproducibility per (task, member)
-        sample_idx = np.array(domain_idx[:EVAL_BATCH], dtype=np.int32)
+        # random sample from domain (was deterministic first-N, causing bias)
+        sample_idx = np.random.choice(
+            domain_idx, size=min(EVAL_BATCH, len(domain_idx)), replace=False,
+        ).astype(np.int32)
         if len(sample_idx) < EVAL_BATCH:
             extra = np.random.choice(domain_idx, EVAL_BATCH - len(sample_idx))
             sample_idx = np.concatenate([sample_idx, extra.astype(np.int32)])
@@ -1092,7 +1113,7 @@ def gea_fitness_fn(params, task):
     return fitness, {"energy_loss": -fitness, "num_chunks": EVAL_BATCH}
 
 
-gea_optimizer = optax.chain(optax.clip_by_global_norm(1.0), optax.adam(1e-3))
+gea_optimizer = optax.chain(optax.clip_by_global_norm(1.0), optax.adamw(1e-3, weight_decay=0.01))
 gea_opt_state = gea_optimizer.init(trainable)
 evolver = GroupEvolver(population_size=GEA_POP, group_size=GEA_GROUP)
 
@@ -1132,8 +1153,8 @@ print(f"\nPhase 3 done: {(time.time()-gea_start)/60:.1f}m")
 
 final_bb = eqx.combine(trainable["backbone"], _bb_static)
 final_hd = eqx.combine(trainable["head"], _hd_static)
-eqx.tree_serialise_leaves("checkpoints/backbone_gea.eqx", final_bb)
-eqx.tree_serialise_leaves("checkpoints/energy_head_gea.eqx", final_hd)
+eqx.tree_serialise_leaves("checkpoints/backbone_gea.eqx", trainable["backbone"])
+eqx.tree_serialise_leaves("checkpoints/energy_head_gea.eqx", trainable["head"])
 if DRIVE_DIR != "checkpoints":
     shutil.copy2("checkpoints/backbone_gea.eqx", f"{DRIVE_DIR}/backbone_gea.eqx")
     shutil.copy2("checkpoints/energy_head_gea.eqx", f"{DRIVE_DIR}/energy_head_gea.eqx")
@@ -1158,6 +1179,7 @@ try:
     plt.show()
 except Exception:  # pylint: disable=broad-except
     pass
+plt.close(fig)
 
 # %%
 print("\n" + "=" * 60)
@@ -1280,6 +1302,7 @@ try:
     plt.show()
 except Exception:
     pass
+plt.close(fig)
 
 
 # %% — 11. Summary & Download
@@ -1292,8 +1315,6 @@ print(f"Dataset:     {num_chunks:,} chunks across {len(set(chunk_labels)):,} dom
 print(f"AE accuracy: {final_acc:.4%}")
 print(f"GEA iters:   {GEA_ITERATIONS} (bias={GEA_BIAS})")
 print("\nCheckpoints saved:")
-print("  checkpoints/backbone_grad.eqx      — gradient backbone (if used)")
-print("  checkpoints/energy_head_grad.eqx   — gradient head (if used)")
 print("  checkpoints/backbone_eggroll.eqx   — EGGROLL backbone")
 print("  checkpoints/energy_head_eggroll.eqx — energy head (EGGROLL)")
 print("  checkpoints/backbone_gea.eqx       — GEA-evolved backbone")
