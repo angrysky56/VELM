@@ -12,43 +12,51 @@
 # ---
 
 # %% [markdown]
-# # VELM POC v3: Can EGGROLL match backprop?
+# # VELM POC v4: Can EGGROLL match backprop?
 #
 # [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/angrysky56/VELM/blob/main/notebooks/poc_eggroll_vs_backprop.ipynb)
 #
-# **The single go/no-go experiment for VELM**, third iteration.
+# **The single go/no-go experiment for VELM**, fourth iteration.
 #
 # **History:**
 # - **v1 FAIL (task)** — next-chunk pooled-random-embedding targets were ~pure
 #   irreducible entropy; even backprop converged to the mean predictor.
-# - **v2 FAIL (population starvation?)** — teacher-distillation targets fixed the
-#   task (backprop broke through its ~900-step plateau → MSE 0.63 and falling).
-#   EGGROLL at pop=32 learned only the trivial mean solution. But 32 antithetic
-#   directions in a 1.5M-dim space is a 50,000:1 ratio; the EGGROLL paper used
-#   populations up to **262,144**. v2 never tested the paper's actual claim.
+# - **v2 FAIL (population starvation)** — teacher-distillation targets fixed the
+#   task; backprop escaped its ~900-step plateau → MSE 0.63. EGGROLL pop=32
+#   stuck at the mean solution.
+# - **v3 SANITY FAIL — but with the first positive ES signals.** Identical
+#   backprop code failed to escape the plateau this time (escape is
+#   bifurcation-flaky). Meanwhile pop-512 ES went *below* backprop (0.9795 vs
+#   0.9846, still descending at step 3000) and warm-started ES captured 92% of
+#   backprop's post-plateau gain. Population scaling works; the task keeps
+#   failing us.
 #
-# **v3 tests two hypotheses at once:**
+# **v4 diagnosis:** the plateau is an artifact of **random student input
+# embeddings** — the model must first organize a random hash of 50k tokens
+# before any sequence learning can begin. That barrier is ours, not VELM's
+# (the real pipeline feeds the backbone *trained CALM-AE embeddings*).
 #
-# 1. **Population starvation** (Run B): pop **512** antithetic (1024 evals/step),
-#    3000 steps. Faithful to the paper's design: fitness is evaluated in
-#    GPU-parallel chunks, and perturbations are **regenerated from RNG keys**
-#    in a second pass rather than stored — the paper's memory trick (at 1.5M
-#    params the FLOP-side matmul reordering is irrelevant; noise-on-demand +
-#    large population is the algorithmic content).
-# 2. **Plateau escape vs refinement** (Run C): warm-start ES from backprop's
-#    step-900 plateau checkpoint. If ES can descend where backprop found signal,
-#    ES can *refine* but not *escape* — which argues for a hybrid VELM
-#    (backprop pretraining, ES for GEA self-improvement only).
+# **v4 changes:**
+#
+# 1. Student inputs = the **teacher's own input embeddings** (wte,
+#    JL-projected 768→64, standardized). Tokens arrive with semantic geometry;
+#    the test becomes sequence dynamics — what we actually care about.
+# 2. **Linear-probe baseline**: ridge regression from the current chunk's
+#    embeddings to the target. Quantifies the lexical shortcut; the backbone
+#    must beat it to demonstrate sequence memory.
+# 3. **Two backprop seeds** (best kept) to de-flake the sanity gate.
+# 4. Budgets: backprop 4000 steps × 2 seeds, ES 4000 steps (was still
+#    descending at v3's 3000).
 #
 # **Combined verdict** (automated, final cell):
 #
 # | Run B (pop 512) | Run C (warm start) | Reading |
 # |---|---|---|
-# | ✅ matches backprop | — | v2 was population starvation → wager holds, proceed |
-# | ❌ | ✅ descends | ES refines but can't escape plateaus → hybrid VELM |
-# | ❌ | ❌ | wager dead at this scale → pivot |
+# | ✅ matches backprop | — | wager holds → proceed to Phase 3 with large-pop EGGROLL |
+# | ❌ | ✅ descends | ES refines but can't explore → hybrid VELM (backprop core, ES for GEA) |
+# | ❌ | ❌ | wager dead at consumer scale → pivot |
 #
-# Runtime: ~1–1.5 h on a free Colab T4. No Google Drive needed.
+# Runtime: ~1.5–2 h on a free Colab T4. No Google Drive needed.
 
 # %% [markdown]
 # ## 1 · Setup
@@ -105,7 +113,7 @@ if not any(d.platform == "gpu" for d in jax.devices()):
 # %%
 CFG = {
     "seed": 42,
-    # ── data / teacher (unchanged from v2 → target cache reusable) ──
+    # ── data / teacher ────────────────────────────────────
     "teacher_id": "distilgpt2",
     "chunk_k": 4,
     "seq_len": 128,
@@ -120,15 +128,16 @@ CFG = {
     "swa_layers": 2,
     "ffn_intermediate": 256,
     "embed_dim": 64,
-    # ── Run A: backprop ───────────────────────────────────
-    "bp_steps": 1500,
+    # ── Run A: backprop (2 seeds, best kept) ──────────────
+    "bp_steps": 4000,
+    "bp_seed_offsets": [100, 300],
     "bp_lr": 1e-3,
     "bp_weight_decay": 0.01,
-    "bp_plateau_step": 900,       # checkpoint for the warm-start diagnostic
+    "bp_plateau_step": 900,
     # ── Run B: EGGROLL-XL from scratch ────────────────────
-    "es_steps": 3000,
-    "es_pop": 512,                # antithetic directions → 1024 evals/step
-    "es_chunk": 64,               # members vmapped per GPU chunk
+    "es_steps": 4000,
+    "es_pop": 512,
+    "es_chunk": 64,
     "es_rank": 1,
     "es_sigma": 1e-3,
     "es_sigma_min": 3e-4,
@@ -137,6 +146,9 @@ CFG = {
     "es_adaptive_sigma": True,
     # ── Run C: warm-start ES from backprop plateau ────────
     "warm_steps": 1000,
+    # ── probe baseline ────────────────────────────────────
+    "probe_lambda": 1e-2,
+    "probe_train_seqs": 512,
     # ── shared ────────────────────────────────────────────
     "grad_clip": 1.0,
     "eval_every": 50,
@@ -145,7 +157,7 @@ assert CFG["es_pop"] % CFG["es_chunk"] == 0
 key = jax.random.PRNGKey(CFG["seed"])
 
 # %% [markdown]
-# ## 3 · Data (identical to v2)
+# ## 3 · Data (identical to v2/v3)
 
 # %%
 from datasets import load_dataset
@@ -176,17 +188,25 @@ seqs_np = seqs_np[rng.permutation(seqs_np.shape[0])]
 print(f"sequences: {seqs_np.shape}  ({seqs_np.size:,} tokens)")
 
 # %% [markdown]
-# ## 4 · Targets: contextual teacher hidden states (identical to v2)
+# ## 4 · Teacher targets + student input embeddings
+#
+# Targets (unchanged from v2/v3): distilgpt2 *contextual* hidden states at
+# chunk boundaries, JL-projected 768→64, standardized (R² = 1 − MSE).
+#
+# **New in v4:** student input embeddings are the teacher's input embedding
+# table (wte), JL-projected 768→64 and standardized — semantic geometry in,
+# so the experiment measures sequence modeling, not lexicon reconstruction.
 
 # %%
-TARGET_CACHE = os.path.join(VELM_DIR, "checkpoints", "poc_teacher_targets.npy")
-os.makedirs(os.path.dirname(TARGET_CACHE), exist_ok=True)
+CKPT_DIR = os.path.join(VELM_DIR, "checkpoints")
+os.makedirs(CKPT_DIR, exist_ok=True)
+TARGET_CACHE = os.path.join(CKPT_DIR, "poc_teacher_targets.npy")
+EMBED_CACHE = os.path.join(CKPT_DIR, "poc_student_embed.npy")
 
-if os.path.exists(TARGET_CACHE):
-    targets_np = np.load(TARGET_CACHE)
-    assert targets_np.shape[:2] == seqs_np.shape[:2], "stale cache — delete and re-run"
-    print(f"✓ loaded cached targets {targets_np.shape}")
-else:
+need_targets = not os.path.exists(TARGET_CACHE)
+need_embed = not os.path.exists(EMBED_CACHE)
+
+if need_targets or need_embed:
     import torch
     from tqdm import tqdm
     from transformers import AutoModelForCausalLM
@@ -201,32 +221,50 @@ else:
         .eval()
     )
     t_dim = teacher.config.hidden_size
-    boundary_pos = np.arange(K - 1, T * K, K)
 
-    proj_rng = np.random.default_rng(CFG["seed"] + 1)
-    JL = proj_rng.standard_normal((t_dim, CFG["embed_dim"])).astype(np.float32)
-    JL /= np.sqrt(CFG["embed_dim"])
+    if need_embed:
+        wte = teacher.get_input_embeddings().weight.detach().float().cpu().numpy()
+        proj_rng = np.random.default_rng(CFG["seed"] + 2)
+        JL_in = proj_rng.standard_normal((t_dim, CFG["embed_dim"])).astype(np.float32)
+        JL_in /= np.sqrt(CFG["embed_dim"])
+        emb = wte @ JL_in                                   # (vocab, 64)
+        emb = (emb - emb.mean(0)) / (emb.std(0) + 1e-6)     # standardize
+        emb /= np.sqrt(CFG["embed_dim"])                    # unit-ish norms
+        np.save(EMBED_CACHE, emb.astype(np.float32))
+        print(f"✓ built student embeddings {emb.shape}")
 
-    chunks_out = []
-    flat_seqs = seqs_np.reshape(-1, T * K)
-    with torch.no_grad():
-        for start in tqdm(range(0, flat_seqs.shape[0], CFG["teacher_batch"]),
-                          desc="teacher"):
-            batch = torch.tensor(
-                flat_seqs[start: start + CFG["teacher_batch"]],
-                dtype=torch.long, device=device,
-            )
-            out = teacher(input_ids=batch, output_hidden_states=True)
-            hid = out.hidden_states[-1][:, boundary_pos, :].float().cpu().numpy()
-            chunks_out.append(hid @ JL)
+    if need_targets:
+        boundary_pos = np.arange(K - 1, T * K, K)
+        proj_rng = np.random.default_rng(CFG["seed"] + 1)
+        JL = proj_rng.standard_normal((t_dim, CFG["embed_dim"])).astype(np.float32)
+        JL /= np.sqrt(CFG["embed_dim"])
 
-    targets_np = np.concatenate(chunks_out, axis=0)
-    targets_np = np.nan_to_num(targets_np, nan=0.0, posinf=0.0, neginf=0.0)
-    np.save(TARGET_CACHE, targets_np)
+        chunks_out = []
+        flat_seqs = seqs_np.reshape(-1, T * K)
+        with torch.no_grad():
+            for start in tqdm(range(0, flat_seqs.shape[0], CFG["teacher_batch"]),
+                              desc="teacher"):
+                batch = torch.tensor(
+                    flat_seqs[start: start + CFG["teacher_batch"]],
+                    dtype=torch.long, device=device,
+                )
+                out = teacher(input_ids=batch, output_hidden_states=True)
+                hid = out.hidden_states[-1][:, boundary_pos, :].float().cpu().numpy()
+                chunks_out.append(hid @ JL)
+
+        targets_np = np.concatenate(chunks_out, axis=0)
+        targets_np = np.nan_to_num(targets_np, nan=0.0, posinf=0.0, neginf=0.0)
+        np.save(TARGET_CACHE, targets_np)
+        print(f"✓ extracted targets {targets_np.shape}")
+
     del teacher
     if device == "cuda":
         torch.cuda.empty_cache()
-    print(f"✓ extracted targets {targets_np.shape}")
+
+targets_np = np.load(TARGET_CACHE)
+assert targets_np.shape[:2] == seqs_np.shape[:2], "stale cache — delete and re-run"
+EMBED = jnp.asarray(np.load(EMBED_CACHE))
+print(f"targets {targets_np.shape}, student embed {EMBED.shape}")
 
 n_tr = CFG["num_train_seqs"]
 mu = targets_np[:n_tr].reshape(-1, CFG["embed_dim"]).mean(axis=0)
@@ -241,13 +279,31 @@ baseline_mean = float(jnp.mean(eval_tgts ** 2))
 print(f"mean-predictor baseline (eval): {baseline_mean:.4f}")
 
 # %% [markdown]
-# ## 5 · Model + loss (shared)
+# ## 5 · Linear-probe baseline
+#
+# Ridge regression from the *current chunk's* embeddings (K·64 = 256 features)
+# to the target. This captures everything achievable without sequence memory.
+# The backbone only demonstrates value beyond a lexical lookup if it beats
+# this number.
 
 # %%
-key, ek = jax.random.split(key)
-EMBED = jax.random.normal(ek, (len(tokenizer), CFG["embed_dim"])) / jnp.sqrt(CFG["embed_dim"])
+Xp = np.asarray(EMBED)[np.asarray(train_seqs[: CFG["probe_train_seqs"]])]  # (S,T,K,e)
+Xp = Xp.reshape(-1, K * CFG["embed_dim"])
+Yp = np.asarray(train_tgts[: CFG["probe_train_seqs"]]).reshape(-1, CFG["embed_dim"])
+XtX = Xp.T @ Xp + CFG["probe_lambda"] * Xp.shape[0] * np.eye(Xp.shape[1], dtype=np.float32)
+W_probe = np.linalg.solve(XtX, Xp.T @ Yp)
+b_probe = Yp.mean(0) - Xp.mean(0) @ W_probe
 
+Xe = np.asarray(EMBED)[np.asarray(eval_seqs)].reshape(-1, K * CFG["embed_dim"])
+Ye = np.asarray(eval_tgts).reshape(-1, CFG["embed_dim"])
+probe_mse = float(np.mean((Xe @ W_probe + b_probe - Ye) ** 2))
+probe_r2 = 1.0 - probe_mse / baseline_mean
+print(f"linear probe (current chunk only): MSE {probe_mse:.4f}  R² {probe_r2:.3f}")
 
+# %% [markdown]
+# ## 6 · Model + loss (shared)
+
+# %%
 def make_model(k):
     kb, kh = jax.random.split(k)
     backbone = VELMBackbone(
@@ -300,14 +356,13 @@ def sample_batch(k):
 
 
 # %% [markdown]
-# ## 6 · Run A — AdamW backprop (+ plateau checkpoint for Run C)
+# ## 7 · Run A — AdamW backprop, 2 seeds, best kept
 
 # %%
 bp_opt = optax.chain(
     optax.clip_by_global_norm(CFG["grad_clip"]),
     optax.adamw(CFG["bp_lr"], weight_decay=CFG["bp_weight_decay"]),
 )
-bp_state = bp_opt.init(params0)
 
 
 @eqx.filter_jit
@@ -317,42 +372,46 @@ def bp_step(params, opt_state, batch, tgts):
     return optax.apply_updates(params, updates), opt_state, loss
 
 
-bp_params, bp_best, bp_best_loss = params0, params0, float("inf")
-plateau_params = None
-bp_eval_hist = []
-dk = jax.random.PRNGKey(CFG["seed"] + 100)
-t0 = time.time()
-for step in range(CFG["bp_steps"]):
-    dk, bk = jax.random.split(dk)
-    batch, tgts = sample_batch(bk)
-    bp_params, bp_state, loss = bp_step(bp_params, bp_state, batch, tgts)
-    if step == CFG["bp_plateau_step"]:
-        plateau_params = bp_params  # snapshot for the warm-start diagnostic
-    if step % CFG["eval_every"] == 0 or step == CFG["bp_steps"] - 1:
-        ev = float(eval_loss(bp_params, eval_seqs, eval_tgts))
-        bp_eval_hist.append((step, time.time() - t0, ev))
-        if ev < bp_best_loss:
-            bp_best_loss, bp_best = ev, bp_params
-        print(f"[backprop {step:5d}] train {float(loss):.4f}  eval {ev:.4f}")
-bp_time = time.time() - t0
-bp_r2 = 1.0 - bp_best_loss / baseline_mean
+def run_backprop(seed_offset):
+    params, opt_state = params0, bp_opt.init(params0)
+    best, best_loss, plateau = params0, float("inf"), None
+    hist = []
+    dk = jax.random.PRNGKey(CFG["seed"] + seed_offset)
+    t0 = time.time()
+    for step in range(CFG["bp_steps"]):
+        dk, bk = jax.random.split(dk)
+        batch, tgts = sample_batch(bk)
+        params, opt_state, loss = bp_step(params, opt_state, batch, tgts)
+        if step == CFG["bp_plateau_step"]:
+            plateau = params
+        if step % CFG["eval_every"] == 0 or step == CFG["bp_steps"] - 1:
+            ev = float(eval_loss(params, eval_seqs, eval_tgts))
+            hist.append((step, time.time() - t0, ev))
+            if ev < best_loss:
+                best_loss, best = ev, params
+            if step % 500 == 0 or step == CFG["bp_steps"] - 1:
+                print(f"[bp seed+{seed_offset} {step:5d}] eval {ev:.4f}")
+    return {"best": best, "best_loss": best_loss, "plateau": plateau,
+            "hist": hist, "time": time.time() - t0}
+
+
+bp_runs = [run_backprop(o) for o in CFG["bp_seed_offsets"]]
+bp_run = min(bp_runs, key=lambda r: r["best_loss"])
+bp_best, bp_best_loss = bp_run["best"], bp_run["best_loss"]
+bp_eval_hist, bp_time = bp_run["hist"], sum(r["time"] for r in bp_runs)
+plateau_params = bp_run["plateau"]
 plateau_eval = float(eval_loss(plateau_params, eval_seqs, eval_tgts))
-print(f"\nbackprop best eval {bp_best_loss:.4f}  R² {bp_r2:.3f}  ({bp_time:.0f}s)")
-print(f"plateau checkpoint (step {CFG['bp_plateau_step']}) eval: {plateau_eval:.4f}")
+bp_r2 = 1.0 - bp_best_loss / baseline_mean
+print(f"\nbackprop best-of-{len(bp_runs)} eval {bp_best_loss:.4f}  R² {bp_r2:.3f}  "
+      f"(all seeds: {[round(r['best_loss'], 4) for r in bp_runs]})")
+print(f"plateau checkpoint eval: {plateau_eval:.4f}")
 
 # %% [markdown]
-# ## 7 · EGGROLL-XL machinery: chunked population, noise regenerated on demand
+# ## 8 · EGGROLL-XL machinery (unchanged from v3, verified two-pass)
 #
-# Two passes per step, exactly the paper's memory design:
-#
-# 1. **Fitness pass** — members evaluated in vmapped chunks of `es_chunk`;
-#    only the 2×pop fitness scalars are kept. Perturbations are *discarded*.
-# 2. **Gradient pass** — perturbations are **regenerated from the same RNG
-#    keys** and accumulated into the weighted ES gradient chunk by chunk.
-#    Peak memory: one chunk of perturbations, never the full population.
-#
-# Fitness diffs are z-scored (scale-invariant update), gradient clipped at the
-# same norm as backprop, σ adaptive within [3e-4, 5e-3].
+# Fitness evaluated in vmapped chunks; perturbations regenerated from RNG keys
+# in a second gradient pass (the paper's memory design). Fitness diffs
+# z-scored, gradient clipped, σ adaptive within [3e-4, 5e-3].
 
 # %%
 N_CHUNKS = CFG["es_pop"] // CFG["es_chunk"]
@@ -364,24 +423,21 @@ def make_es_step(opt):
         member_keys = jax.random.split(step_key, CFG["es_pop"])
         keys_chunked = member_keys.reshape(N_CHUNKS, CFG["es_chunk"], 2)
 
-        # ── pass 1: fitness only (perturbations discarded) ──────────
         def member_fitness(mk):
             _, pert = perturb_pytree(params, mk, sigma, CFG["es_rank"])
             pos = jax.tree.map(lambda p, e: p + sigma * e, params, pert)
             neg = jax.tree.map(lambda p, e: p - sigma * e, params, pert)
             return -batch_loss(pos, batch, tgts), -batch_loss(neg, batch, tgts)
 
-        def fitness_chunk(chunk_keys):
-            return jax.vmap(member_fitness)(chunk_keys)
-
-        f_pos, f_neg = jax.lax.map(fitness_chunk, keys_chunked)  # (C, ch)
-        f_pos, f_neg = f_pos.reshape(-1), f_neg.reshape(-1)      # (pop,)
+        f_pos, f_neg = jax.lax.map(
+            lambda ck: jax.vmap(member_fitness)(ck), keys_chunked
+        )
+        f_pos, f_neg = f_pos.reshape(-1), f_neg.reshape(-1)
 
         diffs = f_pos - f_neg
         diffs = (diffs - jnp.mean(diffs)) / (jnp.std(diffs) + 1e-8)
         diffs_chunked = diffs.reshape(N_CHUNKS, CFG["es_chunk"])
 
-        # ── pass 2: regenerate noise, accumulate weighted gradient ──
         def grad_chunk(carry, xs):
             chunk_keys, chunk_w = xs
 
@@ -410,7 +466,6 @@ def make_es_step(opt):
 
 
 def run_eggroll(start_params, steps, seed_offset, label):
-    """Run EGGROLL-XL from start_params; returns (best_params, best_loss, hist, sigmas)."""
     opt = optax.chain(
         optax.clip_by_global_norm(CFG["grad_clip"]),
         optax.adam(CFG["es_lr"]),
@@ -443,13 +498,14 @@ def run_eggroll(start_params, steps, seed_offset, label):
             hist.append((step, time.time() - t0, ev))
             if ev < best_loss:
                 best_loss, best = ev, params
-            print(f"[{label} {step:5d}] train {float(loss):.4f}  eval {ev:.4f}  σ {sigma:.2e}")
-    print(f"\n{label} best eval {best_loss:.4f}  ({time.time() - t0:.0f}s)")
+            if step % 500 == 0 or step == steps - 1:
+                print(f"[{label} {step:5d}] train {float(loss):.4f}  eval {ev:.4f}  σ {sigma:.2e}")
+    print(f"{label} best eval {best_loss:.4f}  ({time.time() - t0:.0f}s)")
     return best, best_loss, hist, sigmas
 
 
 # %% [markdown]
-# ## 8 · Run B — EGGROLL-XL from scratch (pop 512, 3000 steps)
+# ## 9 · Run B — EGGROLL-XL from scratch (pop 512, 4000 steps)
 
 # %%
 es_best, es_best_loss, es_eval_hist, sigma_hist = run_eggroll(
@@ -459,12 +515,7 @@ es_r2 = 1.0 - es_best_loss / baseline_mean
 print(f"ES-XL R² {es_r2:.3f}")
 
 # %% [markdown]
-# ## 9 · Run C — warm-start ES from the backprop plateau
-#
-# Starts where backprop had already found the breakthrough region
-# (step-900 checkpoint, eval ≈ plateau). If ES descends from here, it can
-# *refine* with local gradient signal present; if it stalls, ES lacks even
-# local signal at this population — not just plateau-escape ability.
+# ## 10 · Run C — warm-start ES from the backprop plateau
 
 # %%
 warm_best, warm_best_loss, warm_eval_hist, warm_sigma_hist = run_eggroll(
@@ -474,7 +525,7 @@ warm_r2 = 1.0 - warm_best_loss / baseline_mean
 print(f"ES-warm R² {warm_r2:.3f}  (started from plateau eval {plateau_eval:.4f})")
 
 # %% [markdown]
-# ## 10 · Results
+# ## 11 · Results
 
 # %%
 import matplotlib.pyplot as plt
@@ -482,9 +533,13 @@ import matplotlib.pyplot as plt
 fig, axes = plt.subplots(1, 3, figsize=(17, 4.5))
 
 ax = axes[0]
-ax.plot(*zip(*[(s, v) for s, _, v in bp_eval_hist]), label="backprop (AdamW)", lw=2)
-ax.plot(*zip(*[(s, v) for s, _, v in es_eval_hist]), label=f"EGGROLL pop {CFG['es_pop']}", lw=2)
+for i, r in enumerate(bp_runs):
+    ax.plot(*zip(*[(s, v) for s, _, v in r["hist"]]),
+            lw=2, alpha=0.8, label=f"backprop seed {i}")
+ax.plot(*zip(*[(s, v) for s, _, v in es_eval_hist]),
+        label=f"EGGROLL pop {CFG['es_pop']}", lw=2, color="tab:orange")
 ax.axhline(baseline_mean, color="gray", ls="--", label="mean baseline")
+ax.axhline(probe_mse, color="purple", ls="-.", label=f"linear probe ({probe_mse:.3f})")
 ax.set(xlabel="optimizer step", ylabel="eval MSE", title="Run A vs Run B (from scratch)")
 ax.legend(); ax.set_yscale("log")
 
@@ -493,6 +548,7 @@ ax.plot(*zip(*[(s, v) for s, _, v in warm_eval_hist]),
         label="ES-warm (from plateau)", lw=2, color="tab:red")
 ax.axhline(plateau_eval, color="tab:blue", ls="--", label=f"plateau start ({plateau_eval:.3f})")
 ax.axhline(bp_best_loss, color="tab:blue", ls=":", label=f"backprop best ({bp_best_loss:.3f})")
+ax.axhline(probe_mse, color="purple", ls="-.", label="linear probe")
 ax.set(xlabel="ES step", ylabel="eval MSE", title="Run C: warm-start diagnostic")
 ax.legend(); ax.set_yscale("log")
 
@@ -505,19 +561,21 @@ ax.legend(); ax.set_yscale("log")
 plt.tight_layout(); plt.show()
 
 # %% [markdown]
-# ## 11 · Verdict
+# ## 12 · Verdict
 
 # %%
 ratio = es_r2 / bp_r2 if bp_r2 > 0 else 0.0
-# warm-start success: recovers a meaningful share of backprop's post-plateau gain
 post_plateau_gain = plateau_eval - bp_best_loss
 warm_gain = plateau_eval - warm_best_loss
 warm_frac = warm_gain / post_plateau_gain if post_plateau_gain > 0 else 0.0
 warm_ok = warm_frac >= 0.25
+uses_memory = bp_best_loss < probe_mse  # beats the no-memory lexical shortcut
 
 print("=" * 66)
 print(f"  mean baseline          : {baseline_mean:.4f}")
-print(f"  backprop  best eval    : {bp_best_loss:.4f}   R² {bp_r2:.3f}   ({bp_time:.0f}s)")
+print(f"  linear probe (no mem)  : {probe_mse:.4f}   R² {probe_r2:.3f}")
+print(f"  backprop  best eval    : {bp_best_loss:.4f}   R² {bp_r2:.3f}   "
+      f"(best of {len(bp_runs)} seeds)")
 print(f"  ES-XL     best eval    : {es_best_loss:.4f}   R² {es_r2:.3f}   "
       f"(pop {CFG['es_pop']}, {CFG['es_steps']} steps)")
 print(f"  R² ratio (ES-XL/BP)    : {ratio:.3f}")
@@ -526,23 +584,30 @@ print(f"  ES-warm   best eval    : {warm_best_loss:.4f}   "
       f"({warm_frac * 100:.0f}% of backprop's post-plateau gain)")
 print("=" * 66)
 
-if bp_best_loss > 0.8:
-    print("❌ TASK SANITY FAIL — backprop did not clearly beat the mean baseline.")
-elif ratio >= 0.90:
-    print("✅ PASS — pop-512 EGGROLL matches backprop. v2 was population "
-          "starvation → the wager holds; population scale is the engineering "
-          "requirement. Proceed to Phase 3 with large-pop EGGROLL.")
-elif ratio >= 0.40:
-    print("🟡 PARTIAL — large-population ES is learning but trails backprop. "
-          "Population/budget scaling trend matters: compare against v2's pop-32 "
-          "result before deciding.")
-elif warm_ok:
-    print("🔵 HYBRID SIGNAL — ES can refine from a good basin (warm-start "
-          "descended) but cannot escape the plateau from scratch at this "
-          "population. Recommended pivot: backprop pretraining + ES only for "
-          "GEA self-improvement (non-differentiable fitness), where ES is "
-          "actually needed.")
+if bp_best_loss > 0.8 * baseline_mean:
+    print("❌ TASK SANITY FAIL — backprop did not clearly beat the mean "
+          "baseline even with semantic input embeddings and 2 seeds × "
+          f"{CFG['bp_steps']} steps. The bottleneck is model capacity or task "
+          "design, not the optimizer. Investigate before judging EGGROLL.")
 else:
-    print("❌ FAIL — even at pop 512 with local gradient signal available, ES "
-          "makes no progress on this backbone. The gradient-free wager is "
-          "dead at consumer scale; pivot VELM to a backprop-trained core.")
+    if not uses_memory:
+        print("⚠️  NOTE — backprop beat the mean baseline but NOT the linear "
+              "probe: the model is exploiting the lexical shortcut, not "
+              "sequence memory. Optimizer comparison below is still valid, "
+              "but the backbone's memory value is unproven on this task.")
+    if ratio >= 0.90:
+        print("✅ PASS — pop-512 EGGROLL matches backprop. The wager holds; "
+              "population scale is the engineering requirement. Proceed to "
+              "Phase 3 with large-pop EGGROLL.")
+    elif ratio >= 0.40:
+        print("🟡 PARTIAL — large-population ES is learning but trails "
+              "backprop. Compare the pop-32 → pop-512 scaling trend and "
+              "consider a bigger population or longer budget before deciding.")
+    elif warm_ok:
+        print("🔵 HYBRID SIGNAL — ES refines from a good basin but cannot "
+              "match backprop from scratch. Recommended pivot: backprop "
+              "pretraining + ES only for GEA self-improvement.")
+    else:
+        print("❌ FAIL — ES makes no meaningful progress even at pop 512. "
+              "The gradient-free wager is dead at consumer scale; pivot VELM "
+              "to a backprop-trained core.")
