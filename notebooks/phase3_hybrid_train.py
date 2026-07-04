@@ -32,12 +32,22 @@
 # 4. Everything except the AE is trained end-to-end with **AdamW backprop**
 #    (warmup + cosine decay).
 #
+# **Run 2 revision** — run 1 (5k steps, 1M tokens) beat the copy baseline but
+# turned out to be a near-unconditional predictor: identical decoded text for
+# different contexts. The eval lacked the unconditional-*cosine* baseline that
+# would have exposed it. Changes: (a) uncond-cosine baseline added — the bar
+# that matters; (b) **prediction-diversity collapse detector**; (c) auxiliary
+# **direct-prediction loss** (`aux_weight`) forcing the backbone to carry
+# next-latent information; (d) 2× data, 8k steps.
+#
 # Success criteria:
 #
-# - eval energy loss clearly below the **copy baseline** (predict `z_t` for
-#   `z_{t+1}`) and the **unconditional mean** baseline
-# - cosine similarity of predicted vs target latent above the copy baseline
-# - qualitative: decoded predicted chunks are plausible continuations
+# - energy loss below the **unconditional-mean** baseline
+# - cosine above the **unconditional cosine** by ≥0.05 (context use, not
+#   marginal-distribution modeling)
+# - prediction diversity ≥ 0.2 (not collapsed)
+# - qualitative: decoded predictions *differ across contexts* and trend toward
+#   plausible continuations
 #
 # Requirements: `calm_ae_best.eqx` — either in the repo's `checkpoints/`
 # (local) or on Drive at `MyDrive/VELM_checkpoints/` (Colab mounts
@@ -102,7 +112,7 @@ CFG = {
     "latent_dim": 128,
     # ── data ──────────────────────────────────────────────
     "seq_len": 64,                 # chunks per sequence (256 tokens)
-    "num_train_seqs": 4096,
+    "num_train_seqs": 8192,        # ~2M tokens
     "num_eval_seqs": 128,
     "batch_size": 4,
     # ── trainable model ───────────────────────────────────
@@ -114,8 +124,9 @@ CFG = {
     "head_blocks": 2,
     "head_ffn": 512,
     "energy_samples": 8,           # N for the MC energy-score estimator
+    "aux_weight": 1.0,             # direct-prediction anti-collapse loss weight
     # ── optimization ──────────────────────────────────────
-    "steps": 5000,
+    "steps": 8000,
     "peak_lr": 3e-4,
     "warmup_steps": 200,
     "weight_decay": 0.01,
@@ -251,8 +262,19 @@ mean_scores = jax.vmap(
 )(eval_z)
 baseline_copy = float(jnp.mean(copy_scores))
 baseline_uncond = float(jnp.mean(mean_scores))
-print(f"copy baseline energy:   {baseline_copy:.4f}")
-print(f"uncond-mean baseline:   {baseline_uncond:.4f}")
+
+# cosine baselines — the unconditional one is essential: latents share a
+# common direction component, so even a constant predictor scores well on
+# cosine. The model only demonstrates *context use* above this line.
+def _cos(a, b):
+    return jnp.sum(a * b, axis=-1) / (
+        jnp.linalg.norm(a, axis=-1) * jnp.linalg.norm(b, axis=-1) + 1e-8)
+
+copy_cos_base = float(jnp.mean(_cos(eval_z[:, :-1], eval_z[:, 1:])))
+uncond_cos_base = float(jnp.mean(_cos(jnp.broadcast_to(z_mean, eval_z[:, 1:].shape),
+                                      eval_z[:, 1:])))
+print(f"copy baseline energy:   {baseline_copy:.4f}   cos {copy_cos_base:.3f}")
+print(f"uncond-mean baseline:   {baseline_uncond:.4f}   cos {uncond_cos_base:.3f}")
 
 # %% [markdown]
 # ## 7 · Trainable model: backbone + energy head
@@ -276,7 +298,13 @@ head = EnergyHead(
     ffn_intermediate=CFG["head_ffn"],
     key=kh,
 )
-model = {"backbone": backbone, "head": head}
+# auxiliary deterministic head: forces the backbone to carry next-latent
+# information (anti-collapse pressure); the energy head models the
+# distribution on top of an informative h. POC v4 proved this direct path
+# trains reliably with backprop.
+key, kd = jax.random.split(key)
+direct = eqx.nn.Linear(CFG["dim"], CFG["latent_dim"], key=kd)
+model = {"backbone": backbone, "head": head, "direct": direct}
 params, static = eqx.partition(model, eqx.is_inexact_array)
 n_params = sum(x.size for x in jax.tree.leaves(params))
 print(f"trainable params: {n_params:,}")
@@ -285,9 +313,9 @@ AE_EMB = frozen_ae.embedding.weight  # (vocab, ae_hidden) — frozen lookup tabl
 
 
 def seq_energy_loss(p, seq_tokens, seq_z, loss_key):
-    """Mean energy score of next-latent prediction over one sequence."""
+    """Energy score + auxiliary direct-prediction loss over one sequence."""
     m = eqx.combine(p, static)
-    bb, hd = m["backbone"], m["head"]
+    bb, hd, dr = m["backbone"], m["head"], m["direct"]
     embs = AE_EMB[seq_tokens]                       # (T, K, ae_hidden)
     inp = jax.vmap(bb.compress_input)(embs)         # (T, dim)
     hid, _ = bb(inp)                                # (T, dim)
@@ -298,7 +326,13 @@ def seq_energy_loss(p, seq_tokens, seq_z, loss_key):
         samples = hd(h, key=k, num_samples=CFG["energy_samples"])
         return energy_score(samples, z_t)
 
-    return jnp.mean(jax.vmap(pos_loss)(hid_in, z_tgt, keys))
+    e_loss = jnp.mean(jax.vmap(pos_loss)(hid_in, z_tgt, keys))
+    # aux: deterministic cosine loss — anti-collapse pressure on the backbone
+    d_pred = jax.vmap(dr)(hid_in)
+    d_cos = jnp.sum(d_pred * z_tgt, axis=-1) / (
+        jnp.linalg.norm(d_pred, axis=-1) * jnp.linalg.norm(z_tgt, axis=-1) + 1e-8)
+    aux_loss = jnp.mean(1.0 - d_cos)
+    return e_loss + CFG["aux_weight"] * aux_loss
 
 
 def batch_energy_loss(p, batch_tokens, batch_z, loss_key):
@@ -310,9 +344,11 @@ def batch_energy_loss(p, batch_tokens, batch_z, loss_key):
 
 @eqx.filter_jit
 def eval_metrics(p, seqs, zs, mkey):
-    """Eval energy loss + cosine(prediction-mean, target) vs copy-cosine."""
+    """Energy loss, sample-mean cosine, direct-head cosine, and prediction
+    diversity (std of predictions across contexts ÷ std of targets —
+    ~0 means the model collapsed to an unconditional predictor)."""
     m = eqx.combine(p, static)
-    bb, hd = m["backbone"], m["head"]
+    bb, hd, dr = m["backbone"], m["head"], m["direct"]
 
     def per_seq(seq_tokens, seq_z, k):
         embs = AE_EMB[seq_tokens]
@@ -328,17 +364,20 @@ def eval_metrics(p, seqs, zs, mkey):
             cos = jnp.sum(pred * z_t) / (
                 jnp.linalg.norm(pred) * jnp.linalg.norm(z_t) + 1e-8
             )
-            return es, cos
+            return es, cos, pred
 
-        es, cos = jax.vmap(pos)(hid_in, z_tgt, keys)
-        copy_cos = jnp.sum(seq_z[:-1] * z_tgt, axis=-1) / (
-            jnp.linalg.norm(seq_z[:-1], axis=-1) * jnp.linalg.norm(z_tgt, axis=-1) + 1e-8
+        es, cos, preds = jax.vmap(pos)(hid_in, z_tgt, keys)
+        d_pred = jax.vmap(dr)(hid_in)
+        d_cos = jnp.sum(d_pred * z_tgt, axis=-1) / (
+            jnp.linalg.norm(d_pred, axis=-1) * jnp.linalg.norm(z_tgt, axis=-1) + 1e-8
         )
-        return jnp.mean(es), jnp.mean(cos), jnp.mean(copy_cos)
+        # diversity: how much predictions vary across positions vs targets
+        div = jnp.mean(jnp.std(preds, axis=0)) / (jnp.mean(jnp.std(z_tgt, axis=0)) + 1e-8)
+        return jnp.mean(es), jnp.mean(cos), jnp.mean(d_cos), div
 
     keys = jax.random.split(mkey, seqs.shape[0])
-    es, cos, ccos = jax.vmap(per_seq)(seqs, zs, keys)
-    return jnp.mean(es), jnp.mean(cos), jnp.mean(ccos)
+    es, cos, dcos, div = jax.vmap(per_seq)(seqs, zs, keys)
+    return jnp.mean(es), jnp.mean(cos), jnp.mean(dcos), jnp.mean(div)
 
 
 # %% [markdown]
@@ -380,16 +419,17 @@ for step in range(CFG["steps"]):
     params, opt_state, loss = train_step(params, opt_state, train_seqs[idx], train_z[idx], sk)
     if step % CFG["eval_every"] == 0 or step == CFG["steps"] - 1:
         dk, mk = jax.random.split(dk)
-        es, cos, ccos = eval_metrics(params, eval_seqs, eval_z, mk)
-        es, cos, ccos = float(es), float(cos), float(ccos)
-        hist.append((step, time.time() - t0, es, cos))
+        es, cos, dcos, div = eval_metrics(params, eval_seqs, eval_z, mk)
+        es, cos, dcos, div = float(es), float(cos), float(dcos), float(div)
+        hist.append((step, time.time() - t0, es, cos, dcos, div))
         marker = ""
         if es < best_loss:
             best_loss = es
             save_ckpt(params, "best")
             marker = "  ← best (saved)"
         print(f"[{step:5d}] train {float(loss):.4f}  eval {es:.4f}  "
-              f"cos {cos:.3f} (copy {ccos:.3f}){marker}")
+              f"cos {cos:.3f}/direct {dcos:.3f} (uncond {uncond_cos_base:.3f})  "
+              f"div {div:.2f}{marker}")
     if step and step % CFG["ckpt_every"] == 0:
         save_ckpt(params, "latest")
 save_ckpt(params, "final")
@@ -402,20 +442,26 @@ print(f"\ndone in {time.time() - t0:.0f}s — best eval energy {best_loss:.4f} "
 # %%
 import matplotlib.pyplot as plt
 
-fig, axes = plt.subplots(1, 2, figsize=(12, 4.5))
+fig, axes = plt.subplots(1, 3, figsize=(16, 4.5))
 steps_h = [h[0] for h in hist]
 axes[0].plot(steps_h, [h[2] for h in hist], lw=2, label="model (eval)")
 axes[0].axhline(baseline_copy, color="gray", ls="--", label="copy baseline")
 axes[0].axhline(baseline_uncond, color="gray", ls=":", label="uncond-mean baseline")
 axes[0].set(xlabel="step", ylabel="energy score", title="Eval energy loss")
 axes[0].legend()
-axes[1].plot(steps_h, [h[3] for h in hist], lw=2, label="cos(pred, target)")
-axes[1].axhline(float(jnp.mean(jnp.sum(eval_z[:, :-1] * eval_z[:, 1:], axis=-1) /
-                     (jnp.linalg.norm(eval_z[:, :-1], axis=-1) *
-                      jnp.linalg.norm(eval_z[:, 1:], axis=-1) + 1e-8))),
-                color="gray", ls="--", label="copy cosine")
+axes[1].plot(steps_h, [h[3] for h in hist], lw=2, label="cos (energy-head mean)")
+axes[1].plot(steps_h, [h[4] for h in hist], lw=2, label="cos (direct head)")
+axes[1].axhline(uncond_cos_base, color="red", ls="--",
+                label=f"uncond cos ({uncond_cos_base:.3f}) — must beat this")
+axes[1].axhline(copy_cos_base, color="gray", ls=":", label="copy cos")
 axes[1].set(xlabel="step", ylabel="cosine similarity", title="Latent prediction quality")
 axes[1].legend()
+axes[2].plot(steps_h, [h[5] for h in hist], lw=2, color="tab:green")
+axes[2].axhline(1.0, color="gray", ls="--", label="target diversity")
+axes[2].axhline(0.2, color="red", ls=":", label="collapse threshold")
+axes[2].set(xlabel="step", ylabel="pred std / target std",
+            title="Prediction diversity (collapse detector)")
+axes[2].legend()
 plt.tight_layout(); plt.show()
 
 # %% [markdown]
@@ -435,40 +481,53 @@ embs = AE_EMB[demo_seq]
 inp = jax.vmap(bb.compress_input)(embs)
 hid, _ = bb(inp)
 
+dr = m["direct"]
 demo_key = jax.random.PRNGKey(0)
 for t in [8, 24, 48]:
     dk1, demo_key = jax.random.split(demo_key)
     z_pred = hd.predict(hid[t], key=dk1)
     pred_tokens = jnp.argmax(frozen_ae.decode(z_pred), axis=-1)
+    z_direct = dr(hid[t])
+    direct_tokens = jnp.argmax(frozen_ae.decode(z_direct), axis=-1)
     ctx = tokenizer.decode(np.asarray(demo_seq[max(0, t - 3): t + 1]).reshape(-1))
     truth = tokenizer.decode(np.asarray(demo_seq[t + 1]))
-    pred = tokenizer.decode(np.asarray(pred_tokens))
     print(f"── position {t} ────────────────────────────")
     print(f"  context …{ctx!r}")
-    print(f"  truth    {truth!r}")
-    print(f"  predicted{pred!r}\n")
+    print(f"  truth        {truth!r}")
+    print(f"  energy-head  {tokenizer.decode(np.asarray(pred_tokens))!r}")
+    print(f"  direct-head  {tokenizer.decode(np.asarray(direct_tokens))!r}\n")
+# If both heads print the SAME text for different positions, the model is
+# ignoring context — check the diversity plot above.
 
 # %% [markdown]
 # ## 11 · Verdict
 
 # %%
-final_cos = hist[-1][3]
-copy_cos_val = float(jnp.mean(jnp.sum(eval_z[:, :-1] * eval_z[:, 1:], axis=-1) /
-                     (jnp.linalg.norm(eval_z[:, :-1], axis=-1) *
-                      jnp.linalg.norm(eval_z[:, 1:], axis=-1) + 1e-8)))
-print("=" * 60)
-print(f"  best eval energy : {best_loss:.4f}")
-print(f"  copy baseline    : {baseline_copy:.4f}")
-print(f"  uncond baseline  : {baseline_uncond:.4f}")
-print(f"  final cos(pred,z): {final_cos:.3f}  (copy cos {copy_cos_val:.3f})")
-print("=" * 60)
-if best_loss < min(baseline_copy, baseline_uncond) and final_cos > copy_cos_val:
-    print("✅ Phase 3 core objective met — the hybrid pipeline learns genuine "
-          "next-latent prediction. Next: scale (dim/layers/data), then qTTT + CIB.")
-elif best_loss < min(baseline_copy, baseline_uncond):
-    print("🟡 Beats baselines on energy but not on cosine — likely modeling "
-          "distribution spread more than the mode. Try more steps or larger "
-          "energy_samples.")
+final_cos, final_dcos, final_div = hist[-1][3], hist[-1][4], hist[-1][5]
+best_cos = max(max(h[3] for h in hist), max(h[4] for h in hist))
+print("=" * 64)
+print(f"  best eval energy   : {best_loss:.4f}")
+print(f"  copy baseline      : {baseline_copy:.4f}   cos {copy_cos_base:.3f}")
+print(f"  uncond baseline    : {baseline_uncond:.4f}   cos {uncond_cos_base:.3f}")
+print(f"  final cos          : energy-head {final_cos:.3f} / direct {final_dcos:.3f}")
+print(f"  prediction diversity: {final_div:.2f}  (1.0 = target-like, <0.2 = collapsed)")
+print("=" * 64)
+
+CONTEXT_MARGIN = 0.05  # must beat unconditional cosine by this much
+if final_div < 0.2:
+    print("❌ COLLAPSED — predictions barely vary with context; the model is "
+          "an unconditional latent sampler. Raise aux_weight, extend budget, "
+          "or scale data before re-judging.")
+elif best_loss < baseline_uncond and best_cos > uncond_cos_base + CONTEXT_MARGIN:
+    print("✅ Phase 3 core objective met — genuinely *contextual* next-latent "
+          "prediction (beats the unconditional predictor on both energy and "
+          "cosine, no collapse). Next: scale (dim/layers/data), then qTTT + CIB.")
+elif best_loss < baseline_uncond:
+    print("🟡 WEAK CONTEXT — beats the unconditional baseline on energy but "
+          "not clearly on cosine. Some context signal, mostly marginal "
+          "distribution. More data/steps is the first lever (next-chunk "
+          "latents have high irreducible entropy; contextual structure "
+          "emerges with scale).")
 else:
-    print("❌ Not beating trivial baselines yet — extend budget, check LR, "
-          "or reduce seq_len before scaling.")
+    print("❌ Not beating the unconditional baseline — check LR/budget "
+          "before scaling.")
