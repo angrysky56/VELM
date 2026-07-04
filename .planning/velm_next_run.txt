@@ -1,0 +1,6 @@
+Run the setup cells (Imports, Config, Tokenizer, Data Loading): 6d174557 through 437035a3.
+Skip Phase 1 Training.
+Run the Model Setup cells: 10cb1422 (initializes model/loads AE) and 88f7439e (Teacher vectors).
+Skip Phase 2a and 2b (the 15-hour training).
+Run the newly generated cell below to inject your saved 15-hour checkpoints directly into the model.
+You can then safely run Phase 3 (GEA) or skip straight to the Evaluation cell at the bottom!
