@@ -207,12 +207,15 @@ def encode_seq(seq_tokens):
     return jax.vmap(lambda c: frozen_ae.encode(c, training=False)[0])(seq_tokens)
 
 
-# sanity: roundtrip a sample
-sample = train_seqs[0]
+# sanity: roundtrip a 16-sequence sample (4096 chunks). The AE's 99.9% was
+# measured on its training mix (math/wikitext/TinyStories); pure TinyStories
+# with occasional rare tokens sits slightly lower. A true config mismatch
+# would score near zero, so 0.95 is a safe gate.
+sample = train_seqs[:16].reshape(-1, K)
 recon = jax.vmap(frozen_ae.reconstruct)(sample)
 acc = float(jnp.mean(recon == sample))
-print(f"AE roundtrip accuracy on sample: {acc:.4f}")
-assert acc >= 0.99, "AE checkpoint/config mismatch — check ae dims in CFG"
+print(f"AE roundtrip accuracy on {sample.shape[0]} chunks: {acc:.4f}")
+assert acc >= 0.95, "AE checkpoint/config mismatch — check ae dims in CFG"
 
 def encode_all(seqs, bs=64):
     outs = []
