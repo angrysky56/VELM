@@ -1,16 +1,26 @@
 # VELM: Vector-Evolution Language Model
 
-## A Self-Evolving, Continuous-Latent, Gradient-Free Language Model Architecture
+## A Self-Evolving, Continuous-Latent, Hybrid-Trained Language Model Architecture
 
-**Status:** Research Design Phase
+**Status:** Empirically revised — hybrid architecture (see below)
 
-### Abstract
+### ⚗️ Empirical status (2026-07)
+
+The project's central wager — that gradient-free evolution strategies (EGGROLL) can replace backprop for pretraining the Miras backbone — was put through a four-iteration controlled experiment ([`notebooks/poc_eggroll_vs_backprop.ipynb`](notebooks/poc_eggroll_vs_backprop.ipynb), full analysis in [`docs/poc_findings.md`](docs/poc_findings.md)). Verdict:
+
+- **Backprop trains the nonlinear Miras backbone without difficulty** (R² 0.628 on teacher distillation, ~3× a no-memory linear probe) — BPTT was never the binding constraint at this scale.
+- **ES scales with population but brutally sublinearly**: pop 32 → 512 (16×, ~4M forward evals) reached only R² 0.082. Parity plausibly needs the EGGROLL paper's 10⁴–10⁵ populations — datacenter compute.
+- **ES refines but cannot explore**: warm-started from a backprop checkpoint it captures local gains quickly, then stalls at a noise floor.
+
+**Consequence:** VELM is now a *hybrid* architecture. The CALM autoencoder (✅ trained, 99.9% reconstruction) and Miras backbone + energy head are trained with **backprop**; **ES is scoped to GEA self-improvement**, where fitness (task success, workflow quality) is genuinely non-differentiable and local refinement is exactly what's needed. Each optimizer is used where it is the right tool.
+
+### Abstract (original hypothesis)
 
 VELM proposes a composite language model architecture that integrates six recent advances into a unified system: continuous next-vector prediction (CALM), deep nonlinear associative memory (Miras), gradient-free evolution strategies at scale (EGGROLL), query-only test-time training for long context (qTTT), reasoning compression via conditional information bottleneck (CIB), and group-based open-ended self-improvement (GEA).
 
 The key insight is that these innovations are not merely additive — they unlock capabilities impossible under any single paradigm:
 
-- **Nonlinear RNNs become trainable** because EGGROLL eliminates the need for backpropagation through time
+- ~~**Nonlinear RNNs become trainable** because EGGROLL eliminates the need for backpropagation through time~~ *(falsified at accessible scale — backprop handles the recurrence fine; see Empirical status)*
 - **Continuous-latent generation** becomes efficient because CALM compresses K tokens into single vectors, reducing autoregressive steps by Kx
 - **Deep memory** over continuous vectors replaces shallow linear recurrence with MLP-based associative memory that can actually track state
 - **Long-context failures** are fixed at inference time via query-only TTT, without retraining or growing the KV cache
