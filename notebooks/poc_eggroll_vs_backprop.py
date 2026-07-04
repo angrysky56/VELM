@@ -12,7 +12,7 @@
 # ---
 
 # %% [markdown]
-# # VELM POC: Can EGGROLL match backprop?
+# # VELM POC v2: Can EGGROLL match backprop?
 #
 # [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/angrysky56/VELM/blob/main/notebooks/poc_eggroll_vs_backprop.ipynb)
 #
@@ -21,32 +21,44 @@
 # the Miras backbone to match a backprop baseline on the *identical* model,
 # data, and loss.
 #
-# **Design (deliberately minimal — no confounds):**
+# **Why v2:** v1 used next-chunk prediction of pooled random embeddings. That
+# target is almost pure irreducible entropy — the mean baseline equaled the
+# target variance (1/(embed_dim·K)), and even backprop converged *to* the mean
+# predictor. Diagnosis: task failure, not optimizer failure. v2 switches to
+# **teacher distillation** — the target is a *deterministic function of the
+# input* (zero irreducible entropy), and it is exactly VELM Phase 2's real
+# objective. Backprop can demonstrably win this task, so the ES parity ratio
+# becomes meaningful.
+#
+# **Design:**
 #
 # - **Model**: tiny VELM backbone (real `src/` code, ~1–2M params) + linear head
-# - **Task**: next-chunk vector regression — predict the embedding of chunk
-#   *t+1* from chunks *≤ t* (TinyStories, Qwen tokenizer, K=4)
-# - **Targets**: frozen random embedding table (self-contained; no Drive
-#   checkpoints needed — the *optimizer comparison* is what's under test,
-#   not representation quality)
-# - **Loss**: plain MSE. Deterministic, smooth, identical for both optimizers.
-#   The stochastic energy head is intentionally excluded from this POC.
+# - **Task**: match the teacher's *contextual* hidden state at each chunk
+#   boundary. Teacher = distilgpt2 run over the full sequence, hidden states
+#   taken at the last token of each K=4 chunk, JL-projected 768→64,
+#   standardized. Contextual targets force the student to use sequence memory —
+#   a per-chunk shortcut cannot solve it.
+# - **Loss**: plain MSE on standardized targets (mean-predictor baseline ≈ 1.0,
+#   so R² = 1 − MSE). Deterministic, smooth, identical for both optimizers.
 # - **Runs**: AdamW backprop vs EGGROLL (antithetic, rank-1, `src/` code),
-#   same init, same data order, same step budget
+#   same init, same data order, same step budget, both with grad-clip 1.0.
+# - **v2 ES stabilizers** (v1 destabilized when σ collapsed): z-scored fitness
+#   diffs, σ floor 3e-4 / ceiling 5e-3, best-eval snapshotting.
 #
 # **Verdict criteria** (automated in the final cell):
 #
-# - **PASS** — EGGROLL final eval loss ≤ 1.10× backprop, both beat baselines
-# - **PARTIAL** — EGGROLL clearly learning (≥50% of backprop's improvement) but gap > 10%
-# - **FAIL** — EGGROLL flat or diverging
+# - **Sanity** — backprop MSE ≤ 0.8 (clearly beats mean baseline), else the
+#   task/budget needs revisiting and the optimizer question stays open
+# - **PASS** — EGGROLL R² ≥ 0.90 × backprop R²
+# - **PARTIAL** — EGGROLL R² ≥ 0.40 × backprop R² (learning, but trailing)
+# - **FAIL** — below that: the gradient-free wager is in trouble
 #
-# Runtime: ~20–40 min on a free Colab T4. Nothing here touches Google Drive.
+# Runtime: ~25–45 min on a free Colab T4. Nothing here touches Google Drive.
 
 # %% [markdown]
 # ## 1 · Setup
 
 # %%
-# Install dependencies (Colab-safe; quiet)
 import os
 import subprocess
 import sys
@@ -71,7 +83,6 @@ if IN_COLAB:
         )
     VELM_DIR = "/content/VELM"
 else:
-    # running locally from notebooks/ or repo root
     VELM_DIR = os.path.abspath("..") if os.path.basename(os.getcwd()) == "notebooks" else os.getcwd()
 
 sys.path.insert(0, VELM_DIR)
@@ -96,38 +107,40 @@ if not any(d.platform == "gpu" for d in jax.devices()):
 
 # %% [markdown]
 # ## 2 · Config
-#
-# One place for every knob. Both optimizers share the model/data config;
-# only the optimizer sections differ.
 
 # %%
 CFG = {
     "seed": 42,
-    # ── data ──────────────────────────────────────────────
-    "chunk_k": 4,             # tokens per chunk (CALM K)
-    "seq_len": 128,           # chunks per training sequence (512 tokens)
+    # ── data / teacher ────────────────────────────────────
+    "teacher_id": "distilgpt2",   # small, fast, own tokenizer
+    "chunk_k": 4,                 # tokens per chunk (CALM K)
+    "seq_len": 128,               # chunks per sequence (512 tokens)
     "num_train_seqs": 2048,
     "num_eval_seqs": 128,
-    "batch_size": 8,          # sequences per step
+    "batch_size": 8,              # sequences per step
+    "teacher_batch": 32,          # sequences per teacher forward
     # ── model (tiny; the question is trainability, not capacity) ──
     "dim": 128,
     "num_heads": 4,
     "miras_layers": 2,
     "swa_layers": 2,
     "ffn_intermediate": 256,
-    "embed_dim": 64,          # frozen random embedding / target dim
+    "embed_dim": 64,              # student input embedding & target dim
     # ── backprop run ──────────────────────────────────────
     "bp_steps": 1500,
     "bp_lr": 1e-3,
     "bp_weight_decay": 0.01,
     # ── EGGROLL run ───────────────────────────────────────
     "es_steps": 1500,
-    "es_pop": 32,             # antithetic directions (64 evals/step)
+    "es_pop": 32,                 # antithetic directions (64 evals/step)
     "es_rank": 1,
-    "es_sigma": 1e-3,         # EGGROLL paper default
-    "es_lr": 3e-4,            # Adam on ES gradient (project default)
+    "es_sigma": 1e-3,             # EGGROLL paper default
+    "es_sigma_min": 3e-4,         # v2: floor — v1 collapse to 2.5e-4 caused regression
+    "es_sigma_max": 5e-3,
+    "es_lr": 3e-4,
     "es_adaptive_sigma": True,
     # ── shared ────────────────────────────────────────────
+    "grad_clip": 1.0,
     "eval_every": 50,
 }
 key = jax.random.PRNGKey(CFG["seed"])
@@ -135,18 +148,18 @@ key = jax.random.PRNGKey(CFG["seed"])
 # %% [markdown]
 # ## 3 · Data
 #
-# TinyStories → Qwen tokens → contiguous stream → `(N, seq_len, K)` int32
-# chunk sequences. Small on purpose: a 1–2M-param model can meaningfully
-# model TinyStories statistics.
+# TinyStories → distilgpt2 tokens → contiguous stream → `(N, seq_len, K)`
+# int32 chunk sequences.
 
 # %%
 from datasets import load_dataset
 from transformers import AutoTokenizer
 
-tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen3.5-0.8B", trust_remote_code=True)
+tokenizer = AutoTokenizer.from_pretrained(CFG["teacher_id"])
 
 K, T = CFG["chunk_k"], CFG["seq_len"]
-tokens_needed = (CFG["num_train_seqs"] + CFG["num_eval_seqs"]) * T * K
+N_SEQS = CFG["num_train_seqs"] + CFG["num_eval_seqs"]
+tokens_needed = N_SEQS * T * K
 
 stream, buf = load_dataset("roneneldan/TinyStories", split="train", streaming=True), []
 total = 0
@@ -161,43 +174,98 @@ for ex in stream:
         break
 
 flat = np.concatenate(buf)[: (tokens_needed // (T * K)) * T * K]
-seqs = flat.reshape(-1, T, K)  # (N, T, K)
+seqs_np = flat.reshape(-1, T, K)  # (N, T, K)
 rng = np.random.default_rng(CFG["seed"])
-rng.shuffle(seqs)
-train_seqs = jnp.asarray(seqs[: CFG["num_train_seqs"]])
-eval_seqs = jnp.asarray(seqs[CFG["num_train_seqs"]:])
-print(f"train {train_seqs.shape}, eval {eval_seqs.shape}  "
-      f"({train_seqs.size:,} + {eval_seqs.size:,} tokens)")
+perm = rng.permutation(seqs_np.shape[0])
+seqs_np = seqs_np[perm]
+print(f"sequences: {seqs_np.shape}  ({seqs_np.size:,} tokens)")
 
 # %% [markdown]
-# ## 4 · Targets: frozen random embedding
+# ## 4 · Targets: contextual teacher hidden states
 #
-# A fixed random table `E (vocab, embed_dim)` defines both the backbone
-# input (per-token embeddings, compressed by the backbone's own
-# `compress_input`) and the regression target
-# `z_t = mean_k E[token_{t,k}]`. Predicting `z_{t+1}` from history is a real
-# sequence-modeling problem — the mapping is fixed and structured, so any
-# improvement over the mean-predictor baseline is genuine learning.
+# distilgpt2 runs over each full 512-token sequence; we keep the last-layer
+# hidden state at the **last token of every chunk** (positions K−1, 2K−1, …).
+# Because the teacher is causal, target *t* is a deterministic function of
+# exactly the tokens the student has seen through chunk *t* — zero
+# irreducible entropy, but rich sequence structure. JL-project 768→64
+# (fixed Gaussian, geometry-preserving), then standardize per-dim on the
+# train split so the mean-predictor baseline is ≈ 1.0 and R² = 1 − MSE.
+
+# %%
+TARGET_CACHE = os.path.join(VELM_DIR, "checkpoints", "poc_teacher_targets.npy")
+os.makedirs(os.path.dirname(TARGET_CACHE), exist_ok=True)
+
+if os.path.exists(TARGET_CACHE):
+    targets_np = np.load(TARGET_CACHE)
+    assert targets_np.shape[:2] == seqs_np.shape[:2], "stale cache — delete and re-run"
+    print(f"✓ loaded cached targets {targets_np.shape}")
+else:
+    import torch
+    from tqdm import tqdm
+    from transformers import AutoModelForCausalLM
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    teacher = (
+        AutoModelForCausalLM.from_pretrained(
+            CFG["teacher_id"],
+            torch_dtype=torch.float16 if device == "cuda" else torch.float32,
+        )
+        .to(device)
+        .eval()
+    )
+    t_dim = teacher.config.hidden_size
+    boundary_pos = np.arange(K - 1, T * K, K)  # last token of each chunk
+
+    # fixed JL projection 768 → embed_dim
+    proj_rng = np.random.default_rng(CFG["seed"] + 1)
+    JL = proj_rng.standard_normal((t_dim, CFG["embed_dim"])).astype(np.float32)
+    JL /= np.sqrt(CFG["embed_dim"])
+
+    chunks_out = []
+    flat_seqs = seqs_np.reshape(-1, T * K)
+    with torch.no_grad():
+        for start in tqdm(range(0, flat_seqs.shape[0], CFG["teacher_batch"]),
+                          desc="teacher"):
+            batch = torch.tensor(
+                flat_seqs[start: start + CFG["teacher_batch"]],
+                dtype=torch.long, device=device,
+            )
+            out = teacher(input_ids=batch, output_hidden_states=True)
+            hid = out.hidden_states[-1][:, boundary_pos, :].float().cpu().numpy()
+            chunks_out.append(hid @ JL)  # (B, T, embed_dim)
+
+    targets_np = np.concatenate(chunks_out, axis=0)
+    targets_np = np.nan_to_num(targets_np, nan=0.0, posinf=0.0, neginf=0.0)
+    np.save(TARGET_CACHE, targets_np)
+    del teacher
+    if device == "cuda":
+        torch.cuda.empty_cache()
+    print(f"✓ extracted targets {targets_np.shape}")
+
+# standardize on the train split only
+n_tr = CFG["num_train_seqs"]
+mu = targets_np[:n_tr].reshape(-1, CFG["embed_dim"]).mean(axis=0)
+sd = targets_np[:n_tr].reshape(-1, CFG["embed_dim"]).std(axis=0) + 1e-6
+targets_np = (targets_np - mu) / sd
+
+train_seqs = jnp.asarray(seqs_np[:n_tr])
+eval_seqs = jnp.asarray(seqs_np[n_tr:])
+train_tgts = jnp.asarray(targets_np[:n_tr])
+eval_tgts = jnp.asarray(targets_np[n_tr:])
+baseline_mean = float(jnp.mean(eval_tgts ** 2))  # mean predictor ≈ 1.0
+print(f"mean-predictor baseline (eval): {baseline_mean:.4f}")
+
+# %% [markdown]
+# ## 5 · Model + loss (shared by both optimizers)
 #
-# *(Fidelity upgrade, not needed for the go/no-go: swap `E`-mean targets for
-# CALM AE latents by loading `calm_ae_best.eqx` and replacing `chunk_targets`
-# with `vmap(ae.encode)`.)*
+# Student inputs are frozen random token embeddings — all information enters
+# through token identity, none through the teacher.
 
 # %%
 key, ek = jax.random.split(key)
 EMBED = jax.random.normal(ek, (len(tokenizer), CFG["embed_dim"])) / jnp.sqrt(CFG["embed_dim"])
-EMBED = jax.lax.stop_gradient(EMBED)
 
 
-def chunk_targets(seq_tokens):
-    """(T, K) int32 → (T, embed_dim) mean chunk embeddings."""
-    return EMBED[seq_tokens].mean(axis=1)
-
-
-# %% [markdown]
-# ## 5 · Model + loss (shared by both optimizers)
-
-# %%
 def make_model(k):
     kb, kh = jax.random.split(k)
     backbone = VELMBackbone(
@@ -221,134 +289,110 @@ n_params = sum(x.size for x in jax.tree.leaves(params0))
 print(f"trainable params: {n_params:,}")
 
 
-def seq_loss(params, seq_tokens):
-    """MSE of next-chunk prediction over one (T, K) sequence."""
+def seq_loss(params, seq_tokens, seq_tgt):
+    """MSE of same-position teacher matching over one (T, K) sequence."""
     model = eqx.combine(params, static)
     bb, head = model["backbone"], model["head"]
     embs = EMBED[seq_tokens]                        # (T, K, e)
     inp = jax.vmap(bb.compress_input)(embs)         # (T, dim)
     hid, _ = bb(inp)                                # (T, dim)
-    pred = jax.vmap(head)(hid[:-1])                 # (T-1, e)
-    tgt = chunk_targets(seq_tokens)[1:]             # (T-1, e)
-    return jnp.mean((pred - tgt) ** 2)
+    pred = jax.vmap(head)(hid)                      # (T, e)
+    return jnp.mean((pred - seq_tgt) ** 2)
 
 
-def batch_loss(params, batch_tokens):
-    return jnp.mean(jax.vmap(lambda s: seq_loss(params, s))(batch_tokens))
+def batch_loss(params, batch_tokens, batch_tgts):
+    return jnp.mean(jax.vmap(lambda s, t: seq_loss(params, s, t))(batch_tokens, batch_tgts))
 
 
 @eqx.filter_jit
-def eval_loss(params, seqs):
-    return batch_loss(params, seqs)
+def eval_loss(params, seqs, tgts):
+    return batch_loss(params, seqs, tgts)
 
 
-def cosine_metric(params, seqs):
-    """Mean cosine similarity between predictions and targets on eval set."""
-    model = eqx.combine(params, static)
-    bb, head = model["backbone"], model["head"]
-
-    def per_seq(seq_tokens):
-        embs = EMBED[seq_tokens]
-        inp = jax.vmap(bb.compress_input)(embs)
-        hid, _ = bb(inp)
-        pred, tgt = jax.vmap(head)(hid[:-1]), chunk_targets(seq_tokens)[1:]
-        num = jnp.sum(pred * tgt, axis=-1)
-        den = jnp.linalg.norm(pred, axis=-1) * jnp.linalg.norm(tgt, axis=-1) + 1e-8
-        return jnp.mean(num / den)
-
-    return float(jnp.mean(jax.vmap(per_seq)(seqs)))
-
-
-# %% [markdown]
-# ## 6 · Baselines
-#
-# Floor and sanity reference. Any optimizer must clearly beat the
-# mean-predictor to count as learning.
-
-# %%
-all_eval_tgts = jax.vmap(chunk_targets)(eval_seqs)[:, 1:, :]      # (N, T-1, e)
-global_mean = jax.vmap(chunk_targets)(train_seqs).mean(axis=(0, 1))
-baseline_mean = float(jnp.mean((all_eval_tgts - global_mean) ** 2))
-# "copy current chunk" — a cheap non-trivial predictor
-all_eval_cur = jax.vmap(chunk_targets)(eval_seqs)[:, :-1, :]
-baseline_copy = float(jnp.mean((all_eval_tgts - all_eval_cur) ** 2))
-init_loss = float(eval_loss(params0, eval_seqs))
-print(f"baseline (predict global mean): {baseline_mean:.6f}")
-print(f"baseline (copy current chunk):  {baseline_copy:.6f}")
-print(f"untrained model:                {init_loss:.6f}")
+init_loss = float(eval_loss(params0, eval_seqs, eval_tgts))
+print(f"untrained eval MSE: {init_loss:.4f}")
 
 
 def sample_batch(k):
     idx = jax.random.randint(k, (CFG["batch_size"],), 0, train_seqs.shape[0])
-    return train_seqs[idx]
+    return train_seqs[idx], train_tgts[idx]
 
 
 # %% [markdown]
-# ## 7 · Run A — AdamW backprop (the bar to clear)
+# ## 6 · Run A — AdamW backprop (the bar to clear)
 
 # %%
-bp_opt = optax.adamw(CFG["bp_lr"], weight_decay=CFG["bp_weight_decay"])
+bp_opt = optax.chain(
+    optax.clip_by_global_norm(CFG["grad_clip"]),
+    optax.adamw(CFG["bp_lr"], weight_decay=CFG["bp_weight_decay"]),
+)
 bp_state = bp_opt.init(params0)
 
 
 @eqx.filter_jit
-def bp_step(params, opt_state, batch):
-    loss, grads = eqx.filter_value_and_grad(batch_loss)(params, batch)
+def bp_step(params, opt_state, batch, tgts):
+    loss, grads = eqx.filter_value_and_grad(batch_loss)(params, batch, tgts)
     updates, opt_state = bp_opt.update(grads, opt_state, params)
     return optax.apply_updates(params, updates), opt_state, loss
 
 
-bp_params = params0
-bp_hist, bp_eval_hist = [], []   # (step, train_loss), (step, wall_s, eval_loss)
-key, dk = jax.random.split(key)
+bp_params, bp_best, bp_best_loss = params0, params0, float("inf")
+bp_eval_hist = []  # (step, wall_s, eval_loss)
+dk = jax.random.PRNGKey(CFG["seed"] + 100)
 t0 = time.time()
 for step in range(CFG["bp_steps"]):
     dk, bk = jax.random.split(dk)
-    bp_params, bp_state, loss = bp_step(bp_params, bp_state, sample_batch(bk))
-    bp_hist.append((step, float(loss)))
+    batch, tgts = sample_batch(bk)
+    bp_params, bp_state, loss = bp_step(bp_params, bp_state, batch, tgts)
     if step % CFG["eval_every"] == 0 or step == CFG["bp_steps"] - 1:
-        ev = float(eval_loss(bp_params, eval_seqs))
+        ev = float(eval_loss(bp_params, eval_seqs, eval_tgts))
         bp_eval_hist.append((step, time.time() - t0, ev))
-        print(f"[backprop {step:5d}] train {loss:.6f}  eval {ev:.6f}")
+        if ev < bp_best_loss:
+            bp_best_loss, bp_best = ev, bp_params
+        print(f"[backprop {step:5d}] train {float(loss):.4f}  eval {ev:.4f}")
 bp_time = time.time() - t0
-bp_final = bp_eval_hist[-1][2]
-print(f"\nbackprop done: eval {bp_final:.6f}  cos {cosine_metric(bp_params, eval_seqs):.4f}  ({bp_time:.0f}s)")
+bp_r2 = 1.0 - bp_best_loss / baseline_mean
+print(f"\nbackprop best eval {bp_best_loss:.4f}  R² {bp_r2:.3f}  ({bp_time:.0f}s)")
 
 # %% [markdown]
-# ## 8 · Run B — EGGROLL (antithetic, rank-1, common random numbers)
+# ## 7 · Run B — EGGROLL (antithetic, rank-1, common random numbers)
 #
-# Same init, same data order (same batch keys), same eval schedule. Fitness
-# is `−batch_loss`; every population member sees the same batch (common
-# random numbers → lower ES gradient variance). Uses the repo's
-# `perturb_pytree` — the exact code the full pipeline uses.
+# Same init, same batch keys, same eval schedule. v2 stabilizers: fitness
+# diffs are z-scored before the ES gradient (scale-invariant updates —
+# prevents the blowup v1 showed when σ shrank), gradient clipped at the same
+# norm as backprop, σ clamped to [3e-4, 5e-3].
 
 # %%
-es_opt = optax.adam(CFG["es_lr"])
+es_opt = optax.chain(
+    optax.clip_by_global_norm(CFG["grad_clip"]),
+    optax.adam(CFG["es_lr"]),
+)
 es_state = es_opt.init(params0)
 
 
 @eqx.filter_jit
-def es_step(params, opt_state, batch, step_key, sigma):
+def es_step(params, opt_state, batch, tgts, step_key, sigma):
     member_keys = jax.random.split(step_key, CFG["es_pop"])
 
     def eval_anti(mk):
         _, pert = perturb_pytree(params, mk, sigma, CFG["es_rank"])
         pos = jax.tree.map(lambda p, e: p + sigma * e, params, pert)
         neg = jax.tree.map(lambda p, e: p - sigma * e, params, pert)
-        f_pos = -batch_loss(pos, batch)
-        f_neg = -batch_loss(neg, batch)
+        f_pos = -batch_loss(pos, batch, tgts)
+        f_neg = -batch_loss(neg, batch, tgts)
         return f_pos, f_neg, pert
 
     f_pos, f_neg, perts = jax.lax.map(eval_anti, member_keys)
     diffs = f_pos - f_neg
+    # z-score the fitness diffs: scale-invariant ES gradient (OpenAI-ES style)
+    diffs = (diffs - jnp.mean(diffs)) / (jnp.std(diffs) + 1e-8)
     fits = (f_pos + f_neg) / 2.0
 
     def wsum(stack):
         w = diffs.reshape((-1,) + (1,) * (stack.ndim - 1))
         return jnp.sum(stack * w, axis=0)
 
-    scale = 1.0 / (2.0 * sigma * CFG["es_pop"])
-    es_grad = jax.tree.map(lambda s: wsum(s) * scale, perts)
+    es_grad = jax.tree.map(lambda s: wsum(s) / CFG["es_pop"], perts)
     es_grad = jax.tree.map(lambda g: jnp.where(jnp.isfinite(g), g, 0.0), es_grad)
     neg_grad = jax.tree.map(lambda g: -g, es_grad)  # optax minimizes
     updates, opt_state = es_opt.update(neg_grad, opt_state, params)
@@ -357,33 +401,38 @@ def es_step(params, opt_state, batch, step_key, sigma):
     return params, opt_state, -jnp.mean(fits), diversity
 
 
-es_params = params0
-es_hist, es_eval_hist, sigma_hist = [], [], []
-adaptor = SigmaAdaptor(initial_sigma=CFG["es_sigma"])
+es_params, es_best, es_best_loss = params0, params0, float("inf")
+es_eval_hist, sigma_hist = [], []
+adaptor = SigmaAdaptor(
+    initial_sigma=CFG["es_sigma"],
+    min_sigma=CFG["es_sigma_min"],
+    max_sigma=CFG["es_sigma_max"],
+)
 sigma = CFG["es_sigma"]
-key, dk2 = jax.random.split(key)
-# reproduce backprop's batch sequence: re-seed identically
-dk2 = jax.random.split(jax.random.PRNGKey(CFG["seed"]))[0]
+dk = jax.random.PRNGKey(CFG["seed"] + 100)  # same batch sequence as backprop
 t0 = time.time()
 for step in range(CFG["es_steps"]):
-    dk2, bk, sk = jax.random.split(dk2, 3)
+    dk, bk = jax.random.split(dk)
+    sk = jax.random.fold_in(bk, 7)
+    batch, tgts = sample_batch(bk)
     es_params, es_state, loss, diversity = es_step(
-        es_params, es_state, sample_batch(bk), sk, jnp.asarray(sigma)
+        es_params, es_state, batch, tgts, sk, jnp.asarray(sigma)
     )
-    es_hist.append((step, float(loss)))
     sigma_hist.append(sigma)
     if CFG["es_adaptive_sigma"]:
         sigma = adaptor.update(float(diversity))
     if step % CFG["eval_every"] == 0 or step == CFG["es_steps"] - 1:
-        ev = float(eval_loss(es_params, eval_seqs))
+        ev = float(eval_loss(es_params, eval_seqs, eval_tgts))
         es_eval_hist.append((step, time.time() - t0, ev))
-        print(f"[EGGROLL  {step:5d}] train {loss:.6f}  eval {ev:.6f}  σ {sigma:.2e}")
+        if ev < es_best_loss:
+            es_best_loss, es_best = ev, es_params
+        print(f"[EGGROLL  {step:5d}] train {float(loss):.4f}  eval {ev:.4f}  σ {sigma:.2e}")
 es_time = time.time() - t0
-es_final = es_eval_hist[-1][2]
-print(f"\nEGGROLL done: eval {es_final:.6f}  cos {cosine_metric(es_params, eval_seqs):.4f}  ({es_time:.0f}s)")
+es_r2 = 1.0 - es_best_loss / baseline_mean
+print(f"\nEGGROLL best eval {es_best_loss:.4f}  R² {es_r2:.3f}  ({es_time:.0f}s)")
 
 # %% [markdown]
-# ## 9 · Results
+# ## 8 · Results
 
 # %%
 import matplotlib.pyplot as plt
@@ -393,8 +442,7 @@ fig, axes = plt.subplots(1, 3, figsize=(16, 4.5))
 ax = axes[0]
 ax.plot(*zip(*[(s, v) for s, _, v in bp_eval_hist]), label="backprop (AdamW)", lw=2)
 ax.plot(*zip(*[(s, v) for s, _, v in es_eval_hist]), label="EGGROLL (ES)", lw=2)
-ax.axhline(baseline_mean, color="gray", ls="--", label="mean baseline")
-ax.axhline(baseline_copy, color="gray", ls=":", label="copy baseline")
+ax.axhline(baseline_mean, color="gray", ls="--", label="mean baseline (≈1.0)")
 ax.set(xlabel="optimizer step", ylabel="eval MSE", title="Loss vs steps")
 ax.legend(); ax.set_yscale("log")
 
@@ -407,38 +455,38 @@ ax.legend(); ax.set_yscale("log")
 
 ax = axes[2]
 ax.plot(sigma_hist, lw=2, color="tab:green")
-ax.set(xlabel="ES step", ylabel="σ", title="EGGROLL σ (adaptive)")
+ax.set(xlabel="ES step", ylabel="σ", title="EGGROLL σ (adaptive, clamped)")
 ax.set_yscale("log")
 
 plt.tight_layout(); plt.show()
 
 # %% [markdown]
-# ## 10 · Verdict
+# ## 9 · Verdict
+#
+# On standardized targets, MSE against a ≈1.0 mean-baseline gives
+# R² = 1 − MSE: the fraction of teacher-state variance the student explains.
 
 # %%
-bp_gain = init_loss - bp_final
-es_gain = init_loss - es_final
-ratio = es_final / bp_final if bp_final > 0 else float("inf")
-beats_baseline = es_final < baseline_mean * 0.95 and bp_final < baseline_mean * 0.95
+ratio = es_r2 / bp_r2 if bp_r2 > 0 else 0.0
 
 print("=" * 62)
-print(f"  untrained            : {init_loss:.6f}")
-print(f"  mean baseline        : {baseline_mean:.6f}")
-print(f"  backprop  final eval : {bp_final:.6f}   ({bp_time:.0f}s)")
-print(f"  EGGROLL   final eval : {es_final:.6f}   ({es_time:.0f}s, "
+print(f"  untrained eval MSE   : {init_loss:.4f}")
+print(f"  mean baseline        : {baseline_mean:.4f}")
+print(f"  backprop  best eval  : {bp_best_loss:.4f}   R² {bp_r2:.3f}   ({bp_time:.0f}s)")
+print(f"  EGGROLL   best eval  : {es_best_loss:.4f}   R² {es_r2:.3f}   ({es_time:.0f}s, "
       f"{2 * CFG['es_pop']}x fwd evals/step)")
-print(f"  EGGROLL / backprop   : {ratio:.3f}")
+print(f"  R² ratio (ES/BP)     : {ratio:.3f}")
 print("=" * 62)
 
-if not beats_baseline:
-    print("❌ FAIL — model(s) did not clearly beat the mean baseline; "
-          "the task setup or budget needs revisiting before judging the optimizer.")
-elif ratio <= 1.10:
-    print("✅ PASS — EGGROLL matches backprop (≤1.10x). "
+if bp_best_loss > 0.8:
+    print("❌ TASK SANITY FAIL — backprop did not clearly beat the mean baseline. "
+          "Fix task/budget before judging the optimizer.")
+elif ratio >= 0.90:
+    print("✅ PASS — EGGROLL matches backprop (R² ratio ≥ 0.90). "
           "The core VELM wager holds at this scale → proceed to Phase 3.")
-elif bp_gain > 0 and es_gain >= 0.5 * bp_gain:
-    print("🟡 PARTIAL — EGGROLL is clearly learning but trails backprop. "
-          "Tune σ / population / lr, or increase the ES step budget, then re-run.")
+elif ratio >= 0.40:
+    print("🟡 PARTIAL — EGGROLL is learning but trails backprop. "
+          "Tune σ / population / lr or extend the ES budget, then re-run.")
 else:
     print("❌ FAIL — EGGROLL is not learning this backbone at this scale. "
           "The gradient-free wager is in trouble; investigate before Phase 3.")
