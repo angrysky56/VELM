@@ -85,6 +85,8 @@ CFG = {
     "seed_chunks": 16,      # context given before rollout starts
     "rollout_steps": 32,    # chunks generated free-running
     "num_eval_rollouts": 32,  # sequences for the decay curve
+    "bank_seqs": 256,       # extra sequences for the manifold-snap bank
+    #   (disjoint from eval rollout sequences — no answer leakage)
     # which checkpoint set to load (newest first)
     "ckpt_versions": ["v2_best", "v2_final", "best", "final"],
 }
@@ -147,7 +149,7 @@ from datasets import load_dataset
 from transformers import AutoTokenizer
 
 tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen3.5-0.8B", trust_remote_code=True)
-need = CFG["num_eval_rollouts"] * T * K
+need = (CFG["num_eval_rollouts"] + CFG["bank_seqs"]) * T * K
 stream, buf, total = load_dataset("roneneldan/TinyStories", split="train",
                                   streaming=True), [], 0
 for ex in stream:
@@ -161,10 +163,20 @@ for ex in stream:
     if total >= need:
         break
 flat = np.concatenate(buf)[: (need // (T * K)) * T * K]
-eval_seqs = jnp.asarray(flat.reshape(-1, T, K))  # same fixed stream-order eval
-print(f"eval sequences: {eval_seqs.shape}")
+all_seqs = flat.reshape(-1, T, K)
+eval_seqs = jnp.asarray(all_seqs[: CFG["num_eval_rollouts"]])  # fixed stream-order
+bank_seqs_np = all_seqs[CFG["num_eval_rollouts"]:]             # disjoint bank
+print(f"eval sequences: {eval_seqs.shape}, bank sequences: {bank_seqs_np.shape}")
 
 encode_seq = eqx.filter_jit(jax.vmap(lambda c: frozen_ae.encode(c, training=False)[0]))
+
+# manifold-snap bank: real chunk latents + their true tokens
+bank_tokens = jnp.asarray(bank_seqs_np.reshape(-1, K))
+bank_z = jnp.concatenate([
+    (encode_seq(bank_tokens[i:i + 4096]) - z_mu) / z_sd
+    for i in range(0, bank_tokens.shape[0], 4096)])
+bank_norm = bank_z / (jnp.linalg.norm(bank_z, axis=-1, keepdims=True) + 1e-8)
+print(f"snap bank: {bank_z.shape[0]:,} chunks")
 
 # %% [markdown]
 # ## 3 · Rollout machinery
@@ -182,11 +194,15 @@ def z_to_tokens(z_std):
     return jnp.argmax(frozen_ae.decode(z_std * z_sd + z_mu), axis=-1)
 
 
-def rollout(seq_tokens, mode, rkey):
+def rollout(seq_tokens, mode, rkey, snap=False):
     """Free-run from seed_chunks; return predicted std-latents (rollout_steps, LAT).
 
     seq_tokens: (T, K) ground-truth sequence (first seed_chunks used as seed).
     mode: "direct" | "energy"
+    snap: if True, project each prediction to the nearest REAL bank latent and
+          re-feed that chunk's true tokens — feedback stays on-manifold, so
+          the exposure-bias death spiral cannot start. Scores still use the
+          raw prediction z_hat (model quality, not bank quality).
     """
     S, R = CFG["seed_chunks"], CFG["rollout_steps"]
     toks = np.asarray(seq_tokens[:S])  # growing (t, K) context
@@ -200,7 +216,12 @@ def rollout(seq_tokens, mode, rkey):
             rkey, sk = jax.random.split(rkey)
             z_hat = head.predict(h, key=sk)
         preds.append(z_hat)
-        next_toks = np.asarray(z_to_tokens(z_hat))[None, :]  # decode → re-feed
+        if snap:
+            zn = z_hat / (jnp.linalg.norm(z_hat) + 1e-8)
+            idx = int(jnp.argmax(bank_norm @ zn))
+            next_toks = np.asarray(bank_tokens[idx])[None, :]  # real chunk
+        else:
+            next_toks = np.asarray(z_to_tokens(z_hat))[None, :]  # raw decode
         toks = np.concatenate([toks, next_toks], axis=0)
     return jnp.stack(preds), toks  # (R, LAT), (S+R, K)
 
@@ -222,18 +243,21 @@ def cos_per_step(preds, true_z):
 
 # %%
 S, R = CFG["seed_chunks"], CFG["rollout_steps"]
-curves = {"teacher-forced": [], "direct rollout": [], "energy rollout": []}
+curves = {"teacher-forced": [], "direct rollout": [], "energy rollout": [],
+          "direct + snap": [], "energy + snap": []}
 rkey = jax.random.PRNGKey(7)
 
 for i in range(CFG["num_eval_rollouts"]):
     seq = eval_seqs[i]
     true_z = (encode_seq(seq[S: S + R]) - z_mu) / z_sd  # (R, LAT) targets
     curves["teacher-forced"].append(cos_per_step(teacher_forced(seq), true_z))
-    p_d, _ = rollout(seq, "direct", rkey)
-    curves["direct rollout"].append(cos_per_step(p_d, true_z))
-    rkey, rk2 = jax.random.split(rkey)
-    p_e, _ = rollout(seq, "energy", rk2)
-    curves["energy rollout"].append(cos_per_step(p_e, true_z))
+    for label, mode, snap in [("direct rollout", "direct", False),
+                              ("energy rollout", "energy", False),
+                              ("direct + snap", "direct", True),
+                              ("energy + snap", "energy", True)]:
+        rkey, rk = jax.random.split(rkey)
+        p, _ = rollout(seq, mode, rk, snap=snap)
+        curves[label].append(cos_per_step(p, true_z))
     if (i + 1) % 8 == 0:
         print(f"  {i + 1}/{CFG['num_eval_rollouts']} rollouts")
 
@@ -250,13 +274,13 @@ plt.title("Compounding error: free-running vs teacher-forced")
 plt.legend(); plt.show()
 
 tf = np.mean(np.stack(curves["teacher-forced"]), axis=0)
-dr = np.mean(np.stack(curves["direct rollout"]), axis=0)
 half = tf * 0.5
-horizon = next((i + 1 for i in range(R) if dr[i] < half[i]), R)
 print(f"teacher-forced mean cos: {tf.mean():.3f}")
-print(f"direct rollout step-1 cos: {dr[0]:.3f}, step-{R} cos: {dr[-1]:.3f}")
-print(f"usable horizon (direct ≥ 50% of teacher-forced): ~{horizon} chunks "
-      f"({horizon * K} tokens)")
+for label in ["direct rollout", "energy rollout", "direct + snap", "energy + snap"]:
+    c = np.mean(np.stack(curves[label]), axis=0)
+    horizon = next((i + 1 for i in range(R) if c[i] < half[i]), R)
+    print(f"{label:16s}: step-1 {c[0]:.3f}  step-{R} {c[-1]:.3f}  "
+          f"horizon ~{horizon} chunks ({horizon * K} tokens)")
 
 # %% [markdown]
 # ## 5 · Read a generation
@@ -270,13 +294,19 @@ print(f"usable horizon (direct ≥ 50% of teacher-forced): ~{horizon} chunks "
 demo = eval_seqs[0]
 _, toks_d = rollout(demo, "direct", jax.random.PRNGKey(0))
 _, toks_e = rollout(demo, "energy", jax.random.PRNGKey(1))
+_, toks_ds = rollout(demo, "direct", jax.random.PRNGKey(0), snap=True)
+_, toks_es = rollout(demo, "energy", jax.random.PRNGKey(1), snap=True)
 seed_text = tokenizer.decode(np.asarray(demo[:S]).reshape(-1))
 true_cont = tokenizer.decode(np.asarray(demo[S: S + R]).reshape(-1))
 print("── SEED ─────────────────────────────────────")
 print(seed_text)
 print("\n── TRUE CONTINUATION ────────────────────────")
 print(true_cont)
-print("\n── VELM (direct head, free-running) ─────────")
+print("\n── VELM (direct, raw feedback) ──────────────")
 print(tokenizer.decode(toks_d[S:].reshape(-1)))
-print("\n── VELM (energy head, free-running) ─────────")
+print("\n── VELM (energy, raw feedback) ──────────────")
 print(tokenizer.decode(toks_e[S:].reshape(-1)))
+print("\n── VELM (direct + manifold snap) ────────────")
+print(tokenizer.decode(toks_ds[S:].reshape(-1)))
+print("\n── VELM (energy + manifold snap) ────────────")
+print(tokenizer.decode(toks_es[S:].reshape(-1)))
