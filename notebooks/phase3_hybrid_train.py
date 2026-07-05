@@ -112,7 +112,7 @@ CFG = {
     "latent_dim": 128,
     # ── data ──────────────────────────────────────────────
     "seq_len": 64,                 # chunks per sequence (256 tokens)
-    "num_train_seqs": 8192,        # ~2M tokens
+    "num_train_seqs": 16384,       # ~4M tokens
     "num_eval_seqs": 128,
     "batch_size": 4,
     # ── trainable model ───────────────────────────────────
@@ -126,7 +126,7 @@ CFG = {
     "energy_samples": 8,           # N for the MC energy-score estimator
     "aux_weight": 1.0,             # direct-prediction anti-collapse loss weight
     # ── optimization ──────────────────────────────────────
-    "steps": 8000,
+    "steps": 12000,
     "peak_lr": 3e-4,
     "warmup_steps": 200,
     "weight_decay": 0.01,
@@ -357,10 +357,11 @@ key, kd = jax.random.split(key)
 direct = eqx.nn.Linear(CFG["dim"], CFG["latent_dim"], key=kd)
 model = {"backbone": backbone, "head": head, "direct": direct}
 
-# Run 4 trains in STANDARDIZED latent space — checkpoints from runs 1–3
-# (raw-latent objective) are incompatible in spirit even where shapes match,
-# so start fresh. Flip to True only to resume a run-4-or-later checkpoint.
-RESUME = False
+# Run 5+: RESUME defaults on — run 4's checkpoints (standardized space,
+# centered-cos 0.074 and rising at cutoff) are the right starting point.
+# Set False only to restart from scratch. NOTE: raw-space checkpoints from
+# runs 1–3 must not be resumed; delete them from Drive if still present.
+RESUME = True
 if RESUME:
     for name, tag in [("backbone", "backbone_hybrid_best.eqx"),
                       ("head", "energy_head_hybrid_best.eqx"),
