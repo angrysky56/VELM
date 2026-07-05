@@ -299,7 +299,7 @@ def train_arm(name, model, loss_fn):
             xb, yb = Xtr[idx], Ytr[idx]
         else:
             idx = jax.random.randint(bk, (CFG["batch_seqs"],), 0, train_seqs.shape[0])
-            xb = train_z[idx] if name == "C" else train_seqs[idx]
+            xb = train_z[idx] if name in ("C", "C2") else train_seqs[idx]
             yb = train_z[idx]
         params, opt_state, l = step(params, opt_state, xb, yb)
         if i % CFG["eval_every"] == 0 or i == CFG["steps"] - 1:
@@ -349,20 +349,74 @@ if not ok(fA):
     print("❌ ARM A FAILED — the training loop/eval itself is buggy: a linear "
           "model with the oracle's exact inputs must match ridge. Fix the "
           "loop before believing anything else.")
-elif not ok(fC):
-    print("❌ ARCHITECTURE — loop is sound (A ≈ oracle) but the Miras "
-          "backbone can't express what a ridge regression does even on "
-          "perfect inputs. Suspects: LTI injection scaling, Miras block "
-          "read/write dynamics, gradient attenuation through the recurrence. "
-          "Debug the backbone before touching data or features.")
-elif not ok(fD):
-    print("✅ FEATURIZATION CONVICTED — the backbone learns fine on true "
-          "latents (C ≈ oracle) but starves on token→frozen-embedding→"
-          "compress_input inputs. Fix: feed the backbone the frozen AE's own "
-          "*encoded latents* of past chunks (teacher-forced z_≤t) instead of "
-          "raw embedding compression — i.e., autoregress in latent space "
-          "exactly as CALM does at inference.")
 else:
-    print("✅ ALL ARMS PASS — with this loop even the token pipeline works; "
-          "the phase3 notebook's loss composition (energy + aux) or its "
-          "hyperparameters were the difference. Diff against this setup.")
+    if ok(fD):
+        print("✅ ARM D PASSES — the full token→compress_input→Miras pipeline "
+              "learns under this loop (pure MSE, lr 1e-3, wd 0). The phase3 "
+              "plateau was the LOSS COMPOSITION (energy-score noise drowning "
+              "the contextual gradient) and/or LR — not featurization, not "
+              "the backbone. Stage phase3: MSE-only representation learning "
+              "first, energy head second.")
+    if not ok(fC):
+        print("⚠️  ARM C FAILS — the backbone dies on direct latent inputs. "
+              "Likely input-scale pathology: the thin proj skips "
+              "compress_input's FFN and feeds ‖z‖≈√latent_dim vectors into "
+              "the LTI injection, which mixes the raw input UNNORMALIZED "
+              "every loop. Run the C2 cell below to test the norm fix. This "
+              "matters for inference: latent-input mode is how VELM "
+              "autoregresses on its own predictions.")
+
+# %% [markdown]
+# ## 6 · C2 — norm-fixed latent input (run if C failed but D passed)
+#
+# Same as arm C, but the projected input is RMS-normalized to unit-RMS before
+# entering the backbone — matching the scale regime `compress_input` produces.
+# If C2 ≈ oracle, latent-input mode just needs input normalization (a one-line
+# change for inference-time autoregression); if C2 still fails, the LTI/
+# memory dynamics have a deeper problem with this input distribution.
+
+# %%
+key2 = jax.random.PRNGKey(CFG["seed"] + 99)
+kc1b, kc2b, kc3b = jax.random.split(key2, 3)
+arm_C2 = {"proj": eqx.nn.Linear(LAT, CFG["dim"], key=kc1b),
+          "bb": make_backbone(kc2b),
+          "head": eqx.nn.Linear(CFG["dim"], LAT, key=kc3b)}
+
+
+def _rms_unit(x):
+    return x / (jnp.sqrt(jnp.mean(x ** 2)) + 1e-8)
+
+
+def loss_C2(model, seq_z_batch, _unused):
+    def per_seq(zs):
+        inp = jax.vmap(lambda z: _rms_unit(model["proj"](z)))(zs[:-1])
+        hid, _ = model["bb"](inp)
+        pred = jax.vmap(model["head"])(hid)
+        return jnp.mean((pred - zs[1:]) ** 2)
+    return jnp.mean(jax.vmap(per_seq)(seq_z_batch))
+
+
+def eval_C2(model):
+    def per_seq(zs):
+        inp = jax.vmap(lambda z: _rms_unit(model["proj"](z)))(zs[:-1])
+        hid, _ = model["bb"](inp)
+        return jax.vmap(model["head"])(hid)
+    preds = jax.vmap(per_seq)(eval_z)
+    return float(ccos(preds.reshape(-1, LAT), eval_z[:, 1:].reshape(-1, LAT)))
+
+
+# reuse the shared loop via a tiny shim
+_eval_arm_orig = eval_arm
+def eval_arm(name, model):  # noqa: F811
+    return eval_C2(model) if name == "C2" else _eval_arm_orig(name, model)
+
+print("Arm C2 — backbone on RMS-normalized latent inputs:")
+hist_C2 = train_arm("C2", arm_C2, loss_C2)
+fC2 = hist_C2[-1][1]
+print(f"\nC2 final ccos {fC2:.4f} vs oracle {oracle_ccos:.4f}")
+if ok(fC2):
+    print("✅ norm fix works — latent-input autoregression is viable with "
+          "input RMS-normalization.")
+else:
+    print("❌ still dead — LTI/memory dynamics mishandle this input "
+          "distribution; deeper backbone debugging needed for latent mode.")

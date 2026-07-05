@@ -130,7 +130,15 @@ CFG = {
     "head_blocks": 2,
     "head_ffn": 512,
     "energy_samples": 8,           # N for the MC energy-score estimator
-    "aux_weight": 1.0,             # direct-prediction anti-collapse loss weight
+    "aux_weight": 1.0,             # direct-prediction loss weight (stage 2)
+    # ── STAGING (input-ablation finding, 2026-07-05) ──────
+    # Arm D proved the full token→compress_input→Miras pipeline reaches the
+    # oracle bar in 3k steps under pure MSE @ lr 1e-3 / wd 0 — the energy
+    # score's stochastic gradient was drowning the contextual signal all
+    # along. Stage 1 ("mse"): representation learning, direct head only.
+    # Stage 2 ("energy+aux"): add the energy head once centered-cos is
+    # established (resume the train state, switch objective).
+    "objective": "mse",            # "mse" (stage 1) | "energy+aux" (stage 2)
     # ── optimization (multi-session) ──────────────────────
     # The LR schedule spans total_steps GLOBALLY; each Colab session runs
     # session_steps and saves the FULL training state (params + optimizer
@@ -141,9 +149,9 @@ CFG = {
     # 16k restores a run-4-like decay profile across two sessions.
     "total_steps": 16000,
     "session_steps": 8000,
-    "peak_lr": 3e-4,
+    "peak_lr": 1e-3,               # arm-D-proven for stage 1
     "warmup_steps": 200,
-    "weight_decay": 0.01,
+    "weight_decay": 0.0,           # arm D ran wd 0; decay added nothing
     "grad_clip": 1.0,
     "eval_every": 100,
     "ckpt_every": 1000,
@@ -414,11 +422,13 @@ def seq_energy_loss(p, seq_tokens, seq_z, loss_key):
         samples = hd(h, key=k, num_samples=CFG["energy_samples"])
         return energy_score(samples, z_t)
 
-    e_loss = jnp.mean(jax.vmap(pos_loss)(hid_in, z_tgt, keys))
-    # aux: deterministic MSE in standardized space (POC-v4-proven objective;
-    # anti-collapse pressure that is sensitive to contextual variance)
+    # stage 1 ("mse"): pure direct-head MSE — the arm-D-proven objective.
+    # The energy head is untouched (zero grads) until stage 2.
     d_pred = jax.vmap(dr)(hid_in)
     aux_loss = jnp.mean((d_pred - z_tgt) ** 2)
+    if CFG["objective"] == "mse":
+        return aux_loss
+    e_loss = jnp.mean(jax.vmap(pos_loss)(hid_in, z_tgt, keys))
     return e_loss + CFG["aux_weight"] * aux_loss
 
 
@@ -534,7 +544,7 @@ def save_state(p, o, gs):
         json.dump({"global_step": gs}, f)
 
 
-best_loss, hist = float("inf"), []
+best_loss, best_ccos, hist = float("inf"), -float("inf"), []
 # batch stream keyed by global step → different data order each session
 dk = jax.random.fold_in(jax.random.PRNGKey(CFG["seed"] + 100), global_step)
 t0 = time.time()
@@ -550,11 +560,14 @@ for i in range(n_sess):
         es, cos, dcos, ccos, div = (float(es), float(cos), float(dcos),
                                     float(ccos), float(div))
         hist.append((gs, time.time() - t0, es, cos, dcos, div, ccos))
+        best_loss = min(best_loss, es)
         marker = ""
-        if es < best_loss:
-            best_loss = es
+        # checkpoint on CENTERED COS (the metric that matters); in mse mode
+        # eval energy reflects the untrained energy head and is uninformative
+        if ccos > best_ccos:
+            best_ccos = ccos
             save_ckpt(params, "best")
-            marker = "  ← best (saved)"
+            marker = "  ← best ccos (saved)"
         print(f"[gs {gs:6d}] train {float(loss):.4f}  eval {es:.4f}  "
               f"cos {cos:.3f}/direct {dcos:.3f}  centered {ccos:.3f}  "
               f"div {div:.2f}{marker}")
