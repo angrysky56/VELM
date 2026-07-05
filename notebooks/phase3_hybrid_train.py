@@ -87,6 +87,12 @@ import time
 
 import equinox as eqx
 import jax
+
+# CRITICAL on A100/H100: JAX defaults matmuls to TF32 (10-bit mantissa).
+# The contextual gradient here is ~1% of the loss — near/below TF32 rounding.
+# T4s (where run 4 learned) do true FP32; force it everywhere.
+jax.config.update("jax_default_matmul_precision", "highest")
+
 import jax.numpy as jnp
 import numpy as np
 import optax
@@ -114,7 +120,7 @@ CFG = {
     "seq_len": 64,                 # chunks per sequence (256 tokens)
     "num_train_seqs": 16384,       # ~4M tokens
     "num_eval_seqs": 128,
-    "batch_size": 4,
+    "batch_size": 8,               # halves gradient noise; A100/T4 both fine
     # ── trainable model ───────────────────────────────────
     "dim": 256,
     "num_heads": 8,
@@ -130,8 +136,11 @@ CFG = {
     # session_steps and saves the FULL training state (params + optimizer
     # moments + global step), so resuming continues the schedule instead of
     # re-warming up over trained weights (run 5's fatal mistake).
-    "total_steps": 48000,
-    "session_steps": 12000,
+    # Run 4's contextual rise coincided with LR *decay* — a 48k horizon kept
+    # LR pinned at peak and the shallow contextual basin never accumulated.
+    # 16k restores a run-4-like decay profile across two sessions.
+    "total_steps": 16000,
+    "session_steps": 8000,
     "peak_lr": 3e-4,
     "warmup_steps": 200,
     "weight_decay": 0.01,
