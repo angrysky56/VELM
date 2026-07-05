@@ -32,22 +32,22 @@
 # 4. Everything except the AE is trained end-to-end with **AdamW backprop**
 #    (warmup + cosine decay).
 #
-# **Run 2 revision** — run 1 (5k steps, 1M tokens) beat the copy baseline but
-# turned out to be a near-unconditional predictor: identical decoded text for
-# different contexts. The eval lacked the unconditional-*cosine* baseline that
-# would have exposed it. Changes: (a) uncond-cosine baseline added — the bar
-# that matters; (b) **prediction-diversity collapse detector**; (c) auxiliary
-# **direct-prediction loss** (`aux_weight`) forcing the backbone to carry
-# next-latent information; (d) 2× data, 8k steps.
+# **Run 4 revision (standardized latent space).** Runs 1–3 trained on RAW
+# latents and extracted zero contextual signal (centered cos 0.005), while the
+# AE-diagnostic exonerated the latent space: smooth (margin 0.59) and linearly
+# predictable (oracle centered-cos 0.125 — 25× the trained model). Root cause:
+# raw latents carry a dominant shared mean direction that soaks up nearly all
+# cosine/energy gradient; the model converges to the marginal and stops.
+# Fix: train **entirely in standardized latent space** ((z−μ)/σ, de-standardize
+# before AE decode), aux loss = MSE (POC-v4-proven), unconditional baseline =
+# marginal *sampler*, and the **linear-oracle bar** computed in-notebook.
 #
 # Success criteria:
 #
-# - energy loss below the **unconditional-mean** baseline
-# - cosine above the **unconditional cosine** by ≥0.05 (context use, not
-#   marginal-distribution modeling)
+# - centered cosine ≥ the linear-oracle bar (~0.125) — the backbone sees
+#   strictly more than the oracle, so matching it is the minimum
+# - decoded token accuracy > unconditional
 # - prediction diversity ≥ 0.2 (not collapsed)
-# - qualitative: decoded predictions *differ across contexts* and trend toward
-#   plausible continuations
 #
 # Requirements: `calm_ae_best.eqx` — either in the repo's `checkpoints/`
 # (local) or on Drive at `MyDrive/VELM_checkpoints/` (Colab mounts
@@ -239,6 +239,22 @@ train_z = encode_all(train_seqs)   # (N, T, latent)
 eval_z = encode_all(eval_seqs)
 print(f"latents: train {train_z.shape}, eval {eval_z.shape}  ({time.time() - t0:.0f}s)")
 
+# ── STANDARDIZE the latent space (run-4 fix) ──────────────────────────
+# Raw latents carry a dominant shared mean direction; cosine/energy losses
+# spend nearly all gradient reproducing it, drowning contextual signal
+# (runs 1–3 pinned at the unconditional cosine; the AE-diagnostic oracle
+# found 25× more structure than the trained model). In standardized space
+# the mean is gone: every unit of cosine is contextual, and per-dim unit
+# variance gives ||z|| ≈ √latent_dim — matching the energy head's output
+# sphere. De-standardize with z_mu/z_sd before AE-decoding.
+z_flat = train_z.reshape(-1, CFG["latent_dim"])
+z_mu = z_flat.mean(axis=0)
+z_sd = z_flat.std(axis=0) + 1e-6
+train_z = (train_z - z_mu) / z_sd
+eval_z = (eval_z - z_mu) / z_sd
+print(f"standardized: mean|z| = {float(jnp.mean(jnp.linalg.norm(eval_z, axis=-1))):.2f} "
+      f"(sphere radius √{CFG['latent_dim']} = {np.sqrt(CFG['latent_dim']):.2f})")
+
 # %% [markdown]
 # ## 6 · Baselines
 #
@@ -253,28 +269,63 @@ def degenerate_energy(pred, tgt):
     return energy_score(jnp.tile(pred[None, :], (2, 1)), tgt)
 
 
-z_mean = train_z.reshape(-1, CFG["latent_dim"]).mean(axis=0)
-copy_scores = jax.vmap(
-    lambda zs: jnp.mean(jax.vmap(degenerate_energy)(zs[:-1], zs[1:]))
-)(eval_z)
-mean_scores = jax.vmap(
-    lambda zs: jnp.mean(jax.vmap(lambda t: degenerate_energy(z_mean, t))(zs[1:]))
-)(eval_z)
-baseline_copy = float(jnp.mean(copy_scores))
-baseline_uncond = float(jnp.mean(mean_scores))
-
-# cosine baselines — the unconditional one is essential: latents share a
-# common direction component, so even a constant predictor scores well on
-# cosine. The model only demonstrates *context use* above this line.
 def _cos(a, b):
     return jnp.sum(a * b, axis=-1) / (
         jnp.linalg.norm(a, axis=-1) * jnp.linalg.norm(b, axis=-1) + 1e-8)
 
+
+z_mean = train_z.reshape(-1, CFG["latent_dim"]).mean(axis=0)  # ≈ 0 (standardized)
+
+# copy: predict z_t for z_{t+1}
+copy_scores = jax.vmap(
+    lambda zs: jnp.mean(jax.vmap(degenerate_energy)(zs[:-1], zs[1:]))
+)(eval_z)
+baseline_copy = float(jnp.mean(copy_scores))
 copy_cos_base = float(jnp.mean(_cos(eval_z[:, :-1], eval_z[:, 1:])))
-uncond_cos_base = float(jnp.mean(_cos(jnp.broadcast_to(z_mean, eval_z[:, 1:].shape),
-                                      eval_z[:, 1:])))
-print(f"copy baseline energy:   {baseline_copy:.4f}   cos {copy_cos_base:.3f}")
-print(f"uncond-mean baseline:   {baseline_uncond:.4f}   cos {uncond_cos_base:.3f}")
+
+# unconditional SAMPLER: N random latents from the marginal pool per position.
+# In standardized space the mean predictor is degenerate (zero vector), so a
+# calibrated marginal sampler is the honest unconditional bar for the energy
+# score. Its cosine is ≈ 0 by construction.
+pool = eval_z.reshape(-1, CFG["latent_dim"])
+bkey = jax.random.PRNGKey(123)
+
+
+def uncond_energy(tgt, k):
+    idx = jax.random.randint(k, (CFG["energy_samples"],), 0, pool.shape[0])
+    return energy_score(pool[idx], tgt)
+
+
+tgts_flat = eval_z[:, 1:].reshape(-1, CFG["latent_dim"])
+ukeys = jax.random.split(bkey, tgts_flat.shape[0])
+baseline_uncond = float(jnp.mean(jax.vmap(uncond_energy)(tgts_flat, ukeys)))
+uncond_cos_base = 0.0  # by construction in standardized space
+print(f"copy baseline energy:    {baseline_copy:.4f}   cos {copy_cos_base:.3f}")
+print(f"uncond-sampler baseline: {baseline_uncond:.4f}   cos ≈ 0")
+
+# %% [markdown]
+# ## 6b · Oracle bar: linear probe from previous latents
+#
+# The AE-diagnostic showed a ridge probe from the previous W latents reaches
+# centered-cos ≈ 0.125. The backbone sees strictly more (raw tokens), so this
+# is the **minimum bar**: a healthy run must at least match the oracle.
+
+# %%
+W_ORACLE, LAM = 4, 1e-1
+Zo = np.asarray(train_z[:512]).reshape(-1, CFG["latent_dim"])
+Xo = np.concatenate([Zo[i:Zo.shape[0] - W_ORACLE + i] for i in range(W_ORACLE)], axis=1)
+Yo = Zo[W_ORACLE:]
+XtX = Xo.T @ Xo + LAM * Xo.shape[0] * np.eye(Xo.shape[1], dtype=np.float32)
+Wp = np.linalg.solve(XtX, Xo.T @ Yo)
+
+Ze = np.asarray(eval_z).reshape(-1, CFG["latent_dim"])
+Xe = np.concatenate([Ze[i:Ze.shape[0] - W_ORACLE + i] for i in range(W_ORACLE)], axis=1)
+Ye = Ze[W_ORACLE:]
+pe = Xe @ Wp
+oracle_ccos = float(np.mean(
+    np.sum(pe * Ye, -1) /
+    (np.linalg.norm(pe, axis=-1) * np.linalg.norm(Ye, axis=-1) + 1e-8)))
+print(f"oracle (linear, prev-{W_ORACLE} latents) cos: {oracle_ccos:.4f}  ← minimum bar")
 
 # %% [markdown]
 # ## 7 · Trainable model: backbone + energy head
@@ -306,10 +357,10 @@ key, kd = jax.random.split(key)
 direct = eqx.nn.Linear(CFG["dim"], CFG["latent_dim"], key=kd)
 model = {"backbone": backbone, "head": head, "direct": direct}
 
-# resume from a previous run's checkpoints if present (delete the files or
-# set RESUME=False to start fresh). The direct head is new in run 2; missing
-# checkpoints are skipped gracefully.
-RESUME = True
+# Run 4 trains in STANDARDIZED latent space — checkpoints from runs 1–3
+# (raw-latent objective) are incompatible in spirit even where shapes match,
+# so start fresh. Flip to True only to resume a run-4-or-later checkpoint.
+RESUME = False
 if RESUME:
     for name, tag in [("backbone", "backbone_hybrid_best.eqx"),
                       ("head", "energy_head_hybrid_best.eqx"),
@@ -344,11 +395,10 @@ def seq_energy_loss(p, seq_tokens, seq_z, loss_key):
         return energy_score(samples, z_t)
 
     e_loss = jnp.mean(jax.vmap(pos_loss)(hid_in, z_tgt, keys))
-    # aux: deterministic cosine loss — anti-collapse pressure on the backbone
+    # aux: deterministic MSE in standardized space (POC-v4-proven objective;
+    # anti-collapse pressure that is sensitive to contextual variance)
     d_pred = jax.vmap(dr)(hid_in)
-    d_cos = jnp.sum(d_pred * z_tgt, axis=-1) / (
-        jnp.linalg.norm(d_pred, axis=-1) * jnp.linalg.norm(z_tgt, axis=-1) + 1e-8)
-    aux_loss = jnp.mean(1.0 - d_cos)
+    aux_loss = jnp.mean((d_pred - z_tgt) ** 2)
     return e_loss + CFG["aux_weight"] * aux_loss
 
 
@@ -477,8 +527,8 @@ axes[0].set(xlabel="step", ylabel="energy score", title="Eval energy loss")
 axes[0].legend()
 axes[1].plot(steps_h, [h[3] for h in hist], lw=2, label="cos (energy-head mean)")
 axes[1].plot(steps_h, [h[4] for h in hist], lw=2, label="cos (direct head)")
-axes[1].axhline(uncond_cos_base, color="red", ls="--",
-                label=f"uncond cos ({uncond_cos_base:.3f}) — must beat this")
+axes[1].axhline(oracle_ccos, color="red", ls="--",
+                label=f"linear-oracle bar ({oracle_ccos:.3f})")
 axes[1].axhline(copy_cos_base, color="gray", ls=":", label="copy cos")
 axes[1].set(xlabel="step", ylabel="cosine similarity", title="Latent prediction quality")
 axes[1].legend()
@@ -512,13 +562,13 @@ def decoded_token_acc(seq_tokens, seq_z):
     embs = AE_EMB[seq_tokens]
     inp = jax.vmap(bb.compress_input)(embs)
     hid, _ = bb(inp)
-    z_pred = jax.vmap(dr)(hid[:-1])                       # (T-1, latent)
+    z_pred = jax.vmap(dr)(hid[:-1]) * z_sd + z_mu         # de-standardize
     logits = jax.vmap(frozen_ae.decode)(z_pred)           # (T-1, K, vocab)
     pred_tok = jnp.argmax(logits, axis=-1)
     return jnp.mean(pred_tok == seq_tokens[1:])
 
 acc_model = float(jnp.mean(jax.vmap(decoded_token_acc)(eval_seqs[:N_ACC], eval_z[:N_ACC])))
-uncond_tok = jnp.argmax(frozen_ae.decode(z_mean), axis=-1)
+uncond_tok = jnp.argmax(frozen_ae.decode(z_mu), axis=-1)  # raw-space mean latent
 acc_uncond = float(jnp.mean(uncond_tok[None, None, :] == eval_seqs[:N_ACC, 1:]))
 print(f"decoded token accuracy — model: {acc_model:.4f}   uncond-mean: {acc_uncond:.4f}")
 
@@ -555,8 +605,9 @@ for t in [8, 24, 48]:
     dk1, demo_key = jax.random.split(demo_key)
     z_pred = hd.predict(hid[t], key=dk1)
     z_direct = dr(hid[t])
-    pred_tokens = jnp.argmax(frozen_ae.decode(z_pred), axis=-1)
-    direct_tokens = jnp.argmax(frozen_ae.decode(z_direct), axis=-1)
+    # de-standardize before AE decode; NN-snap stays in standardized space
+    pred_tokens = jnp.argmax(frozen_ae.decode(z_pred * z_sd + z_mu), axis=-1)
+    direct_tokens = jnp.argmax(frozen_ae.decode(z_direct * z_sd + z_mu), axis=-1)
     ctx = tokenizer.decode(np.asarray(demo_seq[max(0, t - 3): t + 1]).reshape(-1))
     truth = tokenizer.decode(np.asarray(demo_seq[t + 1]))
     print(f"── position {t} ────────────────────────────")
@@ -591,20 +642,20 @@ print(f"  decoded token acc  : model {acc_model:.4f} vs uncond {acc_uncond:.4f}"
 print(f"  prediction diversity: {final_div:.2f}  (1.0 = target-like, <0.2 = collapsed)")
 print("=" * 64)
 
+print(f"  oracle bar (linear)  : {oracle_ccos:.3f}  — model must ≥ this")
 if final_div < 0.2:
     print("❌ COLLAPSED — predictions barely vary with context. Raise "
           "aux_weight, extend budget, or scale data before re-judging.")
-elif best_loss < baseline_uncond and best_ccos >= 0.10 and acc_model > acc_uncond:
-    print("✅ CONTEXTUAL SIGNAL CONFIRMED — beats the unconditional predictor "
-          "on energy, centered cosine, and decoded tokens. The hybrid VELM "
-          "loop works; quality is now a scaling question (data → params → "
-          "steps, in that order). Then qTTT + CIB.")
-elif best_loss < baseline_uncond and (best_ccos > 0.03 or acc_model > acc_uncond):
-    print("🟡 WEAK BUT REAL CONTEXT — small positive centered-cosine/token "
-          "signal above the unconditional floor. First lever: more data "
-          "(10–50M tokens, streaming) and steps; then model width. Track "
-          "centered cos across runs — it should grow with scale.")
+elif best_ccos >= oracle_ccos and acc_model > acc_uncond:
+    print("✅ CONTEXTUAL SIGNAL CONFIRMED — the model matches/beats the "
+          "linear oracle and wins on decoded tokens. The hybrid VELM loop "
+          "works; quality is now a scaling question (data → params → steps). "
+          "Then qTTT + CIB.")
+elif best_ccos >= 0.5 * oracle_ccos:
+    print("🟡 PARTIAL — real contextual signal but below the linear-oracle "
+          "bar despite seeing strictly more information. Levers: more "
+          "steps/data, larger dim, or lower aux_weight late in training.")
 else:
-    print("❌ No measurable context signal — the model is a marginal-"
-          "distribution sampler. Investigate conditioning (aux_weight, "
-          "backbone capacity, LR) before scaling.")
+    print("❌ Below half the oracle bar — the training setup is still not "
+          "extracting the structure a ridge regression finds. Re-examine "
+          "objective/LR/capacity before scaling.")
