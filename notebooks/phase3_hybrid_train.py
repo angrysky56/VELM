@@ -135,10 +135,14 @@ CFG = {
     # Arm D proved the full token→compress_input→Miras pipeline reaches the
     # oracle bar in 3k steps under pure MSE @ lr 1e-3 / wd 0 — the energy
     # score's stochastic gradient was drowning the contextual signal all
-    # along. Stage 1 ("mse"): representation learning, direct head only.
-    # Stage 2 ("energy+aux"): add the energy head once centered-cos is
-    # established (resume the train state, switch objective).
-    "objective": "mse",            # "mse" (stage 1) | "energy+aux" (stage 2)
+    # along. Stage 1 CONFIRMED 2026-07-05: centered-cos 0.167 > oracle 0.130.
+    # Stages:
+    #   "mse"           — stage 1: representation learning, direct head only
+    #   "energy_frozen" — stage 2a: train ONLY the energy head; gradients are
+    #                     stopped at the backbone hidden states, so stage-1
+    #                     representations cannot be damaged
+    #   "energy+aux"    — stage 2b (optional): joint finetune at low LR
+    "objective": "mse",
     # ── optimization (multi-session) ──────────────────────
     # The LR schedule spans total_steps GLOBALLY; each Colab session runs
     # session_steps and saves the FULL training state (params + optimizer
@@ -428,6 +432,12 @@ def seq_energy_loss(p, seq_tokens, seq_z, loss_key):
     aux_loss = jnp.mean((d_pred - z_tgt) ** 2)
     if CFG["objective"] == "mse":
         return aux_loss
+    if CFG["objective"] == "energy_frozen":
+        # stage 2a: energy head only — backbone representations are frozen
+        # via stop_gradient so the energy score's noise can't erode them
+        hid_in = jax.lax.stop_gradient(hid_in)
+        keys = jax.random.split(loss_key, hid_in.shape[0])
+        return jnp.mean(jax.vmap(pos_loss)(hid_in, z_tgt, keys))
     e_loss = jnp.mean(jax.vmap(pos_loss)(hid_in, z_tgt, keys))
     return e_loss + CFG["aux_weight"] * aux_loss
 
@@ -562,12 +572,17 @@ for i in range(n_sess):
         hist.append((gs, time.time() - t0, es, cos, dcos, div, ccos))
         best_loss = min(best_loss, es)
         marker = ""
-        # checkpoint on CENTERED COS (the metric that matters); in mse mode
-        # eval energy reflects the untrained energy head and is uninformative
-        if ccos > best_ccos:
-            best_ccos = ccos
-            save_ckpt(params, "best")
-            marker = "  ← best ccos (saved)"
+        # checkpoint criterion follows the stage: representation stages track
+        # centered cos; energy stages track eval energy (ccos is frozen in 2a)
+        if CFG["objective"] == "mse":
+            if ccos > best_ccos:
+                best_ccos = ccos
+                save_ckpt(params, "best")
+                marker = "  ← best ccos (saved)"
+        else:
+            if es <= best_loss:
+                save_ckpt(params, "best")
+                marker = "  ← best energy (saved)"
         print(f"[gs {gs:6d}] train {float(loss):.4f}  eval {es:.4f}  "
               f"cos {cos:.3f}/direct {dcos:.3f}  centered {ccos:.3f}  "
               f"div {div:.2f}{marker}")
