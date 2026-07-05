@@ -125,8 +125,13 @@ CFG = {
     "head_ffn": 512,
     "energy_samples": 8,           # N for the MC energy-score estimator
     "aux_weight": 1.0,             # direct-prediction anti-collapse loss weight
-    # ── optimization ──────────────────────────────────────
-    "steps": 12000,
+    # ── optimization (multi-session) ──────────────────────
+    # The LR schedule spans total_steps GLOBALLY; each Colab session runs
+    # session_steps and saves the FULL training state (params + optimizer
+    # moments + global step), so resuming continues the schedule instead of
+    # re-warming up over trained weights (run 5's fatal mistake).
+    "total_steps": 48000,
+    "session_steps": 12000,
     "peak_lr": 3e-4,
     "warmup_steps": 200,
     "weight_decay": 0.01,
@@ -198,11 +203,16 @@ for ex in stream:
 
 flat = np.concatenate(buf)[: (tokens_needed // (T * K)) * T * K]
 seqs_np = flat.reshape(-1, T, K)
+# FIXED eval set: the first num_eval_seqs sequences in stream order, BEFORE
+# any permutation. This keeps eval (and the oracle bar) identical across
+# sessions and data-scale changes — run 4 vs 5 were not comparable because
+# the shuffled split moved with num_train_seqs.
+n_ev = CFG["num_eval_seqs"]
+eval_seqs = jnp.asarray(seqs_np[:n_ev])
 rng = np.random.default_rng(CFG["seed"])
-seqs_np = seqs_np[rng.permutation(seqs_np.shape[0])]
-n_tr = CFG["num_train_seqs"]
-train_seqs, eval_seqs = jnp.asarray(seqs_np[:n_tr]), jnp.asarray(seqs_np[n_tr:])
-print(f"train {train_seqs.shape}, eval {eval_seqs.shape}")
+rest = seqs_np[n_ev:]
+train_seqs = jnp.asarray(rest[rng.permutation(rest.shape[0])][: CFG["num_train_seqs"]])
+print(f"train {train_seqs.shape}, eval {eval_seqs.shape} (fixed, stream-order)")
 
 # %% [markdown]
 # ## 5 · AE sanity + precompute latents
@@ -247,9 +257,20 @@ print(f"latents: train {train_z.shape}, eval {eval_z.shape}  ({time.time() - t0:
 # the mean is gone: every unit of cosine is contextual, and per-dim unit
 # variance gives ||z|| ≈ √latent_dim — matching the energy head's output
 # sphere. De-standardize with z_mu/z_sd before AE-decoding.
-z_flat = train_z.reshape(-1, CFG["latent_dim"])
-z_mu = z_flat.mean(axis=0)
-z_sd = z_flat.std(axis=0) + 1e-6
+# standardization stats are FROZEN on first computation and reloaded ever
+# after — recomputing them per session drifts the target space under a
+# resumed model.
+STATS_FILE = os.path.join(CKPT_OUT, "latent_stats.npz")
+if os.path.exists(STATS_FILE):
+    _s = np.load(STATS_FILE)
+    z_mu, z_sd = jnp.asarray(_s["mu"]), jnp.asarray(_s["sd"])
+    print("✓ loaded frozen latent stats")
+else:
+    z_flat = train_z.reshape(-1, CFG["latent_dim"])
+    z_mu = z_flat.mean(axis=0)
+    z_sd = z_flat.std(axis=0) + 1e-6
+    np.savez(STATS_FILE, mu=np.asarray(z_mu), sd=np.asarray(z_sd))
+    print("✓ computed + froze latent stats")
 train_z = (train_z - z_mu) / z_sd
 eval_z = (eval_z - z_mu) / z_sd
 print(f"standardized: mean|z| = {float(jnp.mean(jnp.linalg.norm(eval_z, axis=-1))):.2f} "
@@ -357,23 +378,12 @@ key, kd = jax.random.split(key)
 direct = eqx.nn.Linear(CFG["dim"], CFG["latent_dim"], key=kd)
 model = {"backbone": backbone, "head": head, "direct": direct}
 
-# Run 5+: RESUME defaults on — run 4's checkpoints (standardized space,
-# centered-cos 0.074 and rising at cutoff) are the right starting point.
-# Set False only to restart from scratch. NOTE: raw-space checkpoints from
-# runs 1–3 must not be resumed; delete them from Drive if still present.
-RESUME = True
-if RESUME:
-    for name, tag in [("backbone", "backbone_hybrid_best.eqx"),
-                      ("head", "energy_head_hybrid_best.eqx"),
-                      ("direct", "direct_head_hybrid_best.eqx")]:
-        pth = os.path.join(CKPT_OUT, tag)
-        if os.path.exists(pth):
-            try:
-                model[name] = eqx.tree_deserialise_leaves(pth, model[name])
-                print(f"✓ resumed {name} from {tag}")
-            except Exception as e:
-                print(f"⚠️  {tag} incompatible ({type(e).__name__}) — fresh init")
-
+# NOTE: weights-only resume is gone. Run 5 proved it destructive: loading
+# trained weights into a FRESH optimizer + re-warmed LR schedule bulldozed
+# run 4's contextual features (worth ~1% of the loss, first thing destroyed,
+# last thing relearned). Resume now restores the FULL training state —
+# params + Adam moments + global step — in section 8. Old per-component
+# best-checkpoints remain for inference only.
 params, static = eqx.partition(model, eqx.is_inexact_array)
 n_params = sum(x.size for x in jax.tree.leaves(params))
 print(f"trainable params: {n_params:,}")
@@ -459,17 +469,40 @@ def eval_metrics(p, seqs, zs, mkey):
 # ## 8 · Train (AdamW, warmup + cosine)
 
 # %%
+# LR schedule spans total_steps GLOBALLY. Adam's step count lives inside
+# opt_state, so restoring opt_state automatically continues the schedule —
+# no re-warmup over trained weights.
 schedule = optax.warmup_cosine_decay_schedule(
     init_value=0.0,
     peak_value=CFG["peak_lr"],
     warmup_steps=CFG["warmup_steps"],
-    decay_steps=CFG["steps"],
+    decay_steps=CFG["total_steps"],
+    end_value=CFG["peak_lr"] * 0.05,
 )
 opt = optax.chain(
     optax.clip_by_global_norm(CFG["grad_clip"]),
     optax.adamw(schedule, weight_decay=CFG["weight_decay"]),
 )
 opt_state = opt.init(params)
+
+# ── full training-state resume ────────────────────────────────────────
+import json
+
+STATE_FILE = os.path.join(CKPT_OUT, "train_state.eqx")
+STATE_META = os.path.join(CKPT_OUT, "train_state.json")
+global_step = 0
+if os.path.exists(STATE_FILE) and os.path.exists(STATE_META):
+    try:
+        restored = eqx.tree_deserialise_leaves(
+            STATE_FILE, {"params": params, "opt_state": opt_state})
+        params, opt_state = restored["params"], restored["opt_state"]
+        with open(STATE_META) as f:
+            global_step = json.load(f)["global_step"]
+        print(f"✓ resumed FULL training state at global step {global_step:,}")
+    except Exception as e:
+        print(f"⚠️  train_state incompatible ({type(e).__name__}) — fresh start")
+else:
+    print("no train_state found — fresh start (global step 0)")
 
 
 @eqx.filter_jit
@@ -486,32 +519,44 @@ def save_ckpt(p, tag):
     eqx.tree_serialise_leaves(os.path.join(CKPT_OUT, f"direct_head_hybrid_{tag}.eqx"), m["direct"])
 
 
+def save_state(p, o, gs):
+    eqx.tree_serialise_leaves(STATE_FILE, {"params": p, "opt_state": o})
+    with open(STATE_META, "w") as f:
+        json.dump({"global_step": gs}, f)
+
+
 best_loss, hist = float("inf"), []
-dk = jax.random.PRNGKey(CFG["seed"] + 100)
+# batch stream keyed by global step → different data order each session
+dk = jax.random.fold_in(jax.random.PRNGKey(CFG["seed"] + 100), global_step)
 t0 = time.time()
-for step in range(CFG["steps"]):
+n_sess = min(CFG["session_steps"], CFG["total_steps"] - global_step)
+for i in range(n_sess):
+    gs = global_step + i
     dk, bk, sk = jax.random.split(dk, 3)
     idx = jax.random.randint(bk, (CFG["batch_size"],), 0, train_seqs.shape[0])
     params, opt_state, loss = train_step(params, opt_state, train_seqs[idx], train_z[idx], sk)
-    if step % CFG["eval_every"] == 0 or step == CFG["steps"] - 1:
+    if i % CFG["eval_every"] == 0 or i == n_sess - 1:
         dk, mk = jax.random.split(dk)
         es, cos, dcos, ccos, div = eval_metrics(params, eval_seqs, eval_z, mk)
         es, cos, dcos, ccos, div = (float(es), float(cos), float(dcos),
                                     float(ccos), float(div))
-        hist.append((step, time.time() - t0, es, cos, dcos, div, ccos))
+        hist.append((gs, time.time() - t0, es, cos, dcos, div, ccos))
         marker = ""
         if es < best_loss:
             best_loss = es
             save_ckpt(params, "best")
             marker = "  ← best (saved)"
-        print(f"[{step:5d}] train {float(loss):.4f}  eval {es:.4f}  "
+        print(f"[gs {gs:6d}] train {float(loss):.4f}  eval {es:.4f}  "
               f"cos {cos:.3f}/direct {dcos:.3f}  centered {ccos:.3f}  "
               f"div {div:.2f}{marker}")
-    if step and step % CFG["ckpt_every"] == 0:
-        save_ckpt(params, "latest")
+    if i and i % CFG["ckpt_every"] == 0:
+        save_state(params, opt_state, gs + 1)
+global_step += n_sess
+save_state(params, opt_state, global_step)
 save_ckpt(params, "final")
-print(f"\ndone in {time.time() - t0:.0f}s — best eval energy {best_loss:.4f} "
-      f"(copy {baseline_copy:.4f}, uncond {baseline_uncond:.4f})")
+print(f"\nsession done in {time.time() - t0:.0f}s — global step {global_step:,}"
+      f"/{CFG['total_steps']:,}, best eval energy this session {best_loss:.4f}")
+print("Re-run this notebook (fresh Colab session is fine) to continue training.")
 
 # %% [markdown]
 # ## 9 · Results
