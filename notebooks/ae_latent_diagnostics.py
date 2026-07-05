@@ -204,7 +204,73 @@ chance_ccos = float(np.mean(
 print(f"oracle centered cosine: {oracle_ccos:.4f}   (chance: {chance_ccos:.4f})")
 
 # %% [markdown]
-# ## 5 · Verdict
+# ## 5 · Test C — anisotropy & PCA-whitening (LatentGate, ACL 2026)
+#
+# LatentGate (Ratnakar et al., 2026) shows causal-LM representations collapse
+# into a narrow cone ("representation anisotropy") and that **PCA-whitening**
+# (decorrelation + variance normalization) — not mere per-dim standardization
+# — restores discriminative geometry (+17.2 pts in their ablation vs +8.8 for
+# StandardScaler alone). Our phase-3 standardization fix was exactly their
+# StandardScaler row. This test asks whether full whitening buys more:
+#
+# 1. eigenspectrum of the *standardized* latents (residual anisotropy)
+# 2. the same ridge oracle, recomputed on **whitened** latents
+#
+# If the whitened oracle clearly beats the standardized one, whitening is the
+# next stage-1 upgrade (a purely linear change to the target space).
+
+# %%
+Zs = np.asarray(Z)  # raw latents (N, LAT)
+mu_all = Zs.mean(0)
+sd_all = Zs.std(0) + 1e-6
+Z_std = (Zs - mu_all) / sd_all
+
+# eigenspectrum of standardized latents
+cov = np.cov(Z_std.T)
+eig = np.linalg.eigvalsh(cov)[::-1]
+frac = eig / eig.sum()
+print(f"variance in top 3 / 8 / 16 PCs: "
+      f"{frac[:3].sum():.1%} / {frac[:8].sum():.1%} / {frac[:16].sum():.1%}")
+
+plt.figure(figsize=(7, 3.5))
+plt.bar(range(32), frac[:32])
+plt.xlabel("principal component"); plt.ylabel("variance fraction")
+plt.title("Eigenspectrum of standardized CALM latents")
+plt.show()
+
+# PCA-whitening transform (full rank, ε-regularized)
+evals, evecs = np.linalg.eigh(cov)
+W_wh = evecs @ np.diag(1.0 / np.sqrt(evals + 1e-5)) @ evecs.T  # ZCA whitening
+Z_wh = Z_std @ W_wh
+
+
+def window_oracle(Zmat, w=4, lam=1e-1, split_frac=0.8):
+    X = np.concatenate([Zmat[i: Zmat.shape[0] - w + i] for i in range(w)], axis=1)
+    Y = Zmat[w:]
+    s = int(X.shape[0] * split_frac)
+    m = Y[:s].mean(0)
+    XtX = X[:s].T @ X[:s] + lam * s * np.eye(X.shape[1], dtype=np.float32)
+    Wp = np.linalg.solve(XtX, X[:s].T @ (Y[:s] - m))
+    p = X[s:] @ Wp
+    pc, tc = p, Y[s:] - m
+    return float(np.mean(np.sum(pc * tc, -1) /
+                 (np.linalg.norm(pc, axis=-1) * np.linalg.norm(tc, axis=-1) + 1e-8)))
+
+
+oracle_std = window_oracle(Z_std)
+oracle_wh = window_oracle(Z_wh)
+print(f"ridge oracle — standardized: {oracle_std:.4f}   whitened: {oracle_wh:.4f}")
+if oracle_wh > oracle_std * 1.15:
+    print("✅ WHITENING PAYS — residual anisotropy is hiding predictive "
+          "structure. Stage-1b: train with ZCA-whitened targets (freeze W_wh "
+          "with the stats; de-whiten before AE decode). Existing stage-1 "
+          "models can be re-scored in whitened space linearly, no retrain.")
+else:
+    print("— whitening ≈ standardization here; per-dim scaling already "
+          "captured the gain. No change needed.")
+
+# %% [markdown]
+# ## 6 · Verdict
 
 # %%
 print("=" * 64)
