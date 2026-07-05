@@ -143,6 +143,11 @@ CFG = {
     #                     representations cannot be damaged
     #   "energy+aux"    — stage 2b (optional): joint finetune at low LR
     "objective": "mse",
+    # stage-2a optimization (fresh head → its own schedule + state file;
+    # stage-1 params are loaded but its optimizer state is NOT — safe because
+    # stop_gradient freezes the backbone, so only virgin head params train)
+    "stage2_steps": 8000,
+    "stage2_lr": 3e-4,
     # ── optimization (multi-session) ──────────────────────
     # The LR schedule spans total_steps GLOBALLY; each Colab session runs
     # session_steps and saves the FULL training state (params + optimizer
@@ -498,15 +503,23 @@ def eval_metrics(p, seqs, zs, mkey):
 # ## 8 · Train (AdamW, warmup + cosine)
 
 # %%
-# LR schedule spans total_steps GLOBALLY. Adam's step count lives inside
-# opt_state, so restoring opt_state automatically continues the schedule —
-# no re-warmup over trained weights.
+# LR schedule spans the stage's step budget GLOBALLY. Adam's step count lives
+# inside opt_state, so restoring opt_state continues the schedule — no
+# re-warmup over trained weights. Each stage has its OWN schedule + state
+# file: a fresh energy head must not inherit stage 1's decayed-to-floor LR.
+import json
+
+STAGE2 = CFG["objective"] != "mse"
+stage_total = CFG["stage2_steps"] if STAGE2 else CFG["total_steps"]
+stage_peak = CFG["stage2_lr"] if STAGE2 else CFG["peak_lr"]
+stage_tag = "_s2" if STAGE2 else ""
+
 schedule = optax.warmup_cosine_decay_schedule(
     init_value=0.0,
-    peak_value=CFG["peak_lr"],
+    peak_value=stage_peak,
     warmup_steps=CFG["warmup_steps"],
-    decay_steps=CFG["total_steps"],
-    end_value=CFG["peak_lr"] * 0.05,
+    decay_steps=stage_total,
+    end_value=stage_peak * 0.05,
 )
 opt = optax.chain(
     optax.clip_by_global_norm(CFG["grad_clip"]),
@@ -515,10 +528,9 @@ opt = optax.chain(
 opt_state = opt.init(params)
 
 # ── full training-state resume ────────────────────────────────────────
-import json
-
-STATE_FILE = os.path.join(CKPT_OUT, "train_state.eqx")
-STATE_META = os.path.join(CKPT_OUT, "train_state.json")
+STATE_FILE = os.path.join(CKPT_OUT, f"train_state{stage_tag}.eqx")
+STATE_META = os.path.join(CKPT_OUT, f"train_state{stage_tag}.json")
+S1_STATE = os.path.join(CKPT_OUT, "train_state.eqx")
 global_step = 0
 if os.path.exists(STATE_FILE) and os.path.exists(STATE_META):
     try:
@@ -527,9 +539,17 @@ if os.path.exists(STATE_FILE) and os.path.exists(STATE_META):
         params, opt_state = restored["params"], restored["opt_state"]
         with open(STATE_META) as f:
             global_step = json.load(f)["global_step"]
-        print(f"✓ resumed FULL training state at global step {global_step:,}")
+        print(f"✓ resumed stage state at step {global_step:,} ({STATE_FILE})")
     except Exception as e:
         print(f"⚠️  train_state incompatible ({type(e).__name__}) — fresh start")
+elif STAGE2 and os.path.exists(S1_STATE):
+    # first stage-2 session: load stage-1 PARAMS (backbone/direct/head),
+    # keep the fresh optimizer + schedule for the head-only training
+    restored = eqx.tree_deserialise_leaves(
+        S1_STATE, {"params": params, "opt_state": opt_state})
+    params = restored["params"]
+    print("✓ stage 2 start: loaded stage-1 params, fresh head optimizer "
+          "(backbone frozen via stop_gradient)")
 else:
     print("no train_state found — fresh start (global step 0)")
 
@@ -558,7 +578,10 @@ best_loss, best_ccos, hist = float("inf"), -float("inf"), []
 # batch stream keyed by global step → different data order each session
 dk = jax.random.fold_in(jax.random.PRNGKey(CFG["seed"] + 100), global_step)
 t0 = time.time()
-n_sess = min(CFG["session_steps"], CFG["total_steps"] - global_step)
+n_sess = min(CFG["session_steps"], stage_total - global_step)
+if n_sess <= 0:
+    print(f"stage budget exhausted ({global_step:,}/{stage_total:,}) — "
+          "flip CFG['objective'] for the next stage or raise the budget.")
 for i in range(n_sess):
     gs = global_step + i
     dk, bk, sk = jax.random.split(dk, 3)
@@ -592,7 +615,7 @@ global_step += n_sess
 save_state(params, opt_state, global_step)
 save_ckpt(params, "final")
 print(f"\nsession done in {time.time() - t0:.0f}s — global step {global_step:,}"
-      f"/{CFG['total_steps']:,}, best eval energy this session {best_loss:.4f}")
+      f"/{stage_total:,}, best eval energy this session {best_loss:.4f}")
 print("Re-run this notebook (fresh Colab session is fine) to continue training.")
 
 # %% [markdown]
