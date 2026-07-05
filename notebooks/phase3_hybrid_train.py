@@ -116,10 +116,15 @@ CFG = {
     "ae_hidden_dim": 384,          # gpu_12gb_v2
     "ae_ffn_intermediate": 768,
     "latent_dim": 128,
-    # ── data ──────────────────────────────────────────────
+    # ── data (v2 scale-up) ────────────────────────────────
+    "run_version": "v2",           # versions state/ckpt files; v1 files untouched
     "seq_len": 64,                 # chunks per sequence (256 tokens)
-    "num_train_seqs": 16384,       # ~4M tokens
+    "num_train_seqs": 65536,       # ~16M tokens (4× v1)
     "num_eval_seqs": 128,
+    "wiki_fraction": 0.25,         # train-mix fraction from wikitext-103
+    #   (AE trained on math/wiki/tinystories → wiki is in-distribution;
+    #    eval stays PURE TinyStories first-128 stream order, so baselines,
+    #    oracle bar, and centered-cos stay comparable to v1 runs)
     "batch_size": 8,               # halves gradient noise; A100/T4 both fine
     # ── trainable model ───────────────────────────────────
     "dim": 256,
@@ -153,10 +158,9 @@ CFG = {
     # session_steps and saves the FULL training state (params + optimizer
     # moments + global step), so resuming continues the schedule instead of
     # re-warming up over trained weights (run 5's fatal mistake).
-    # Run 4's contextual rise coincided with LR *decay* — a 48k horizon kept
-    # LR pinned at peak and the shallow contextual basin never accumulated.
-    # 16k restores a run-4-like decay profile across two sessions.
-    "total_steps": 16000,
+    # v2: 4× data → longer cycle (4 sessions). v1 lesson stands: contextual
+    # gains accrue as LR decays; keep the full cosine cycle over the budget.
+    "total_steps": 32000,
     "session_steps": 8000,
     "peak_lr": 1e-3,               # arm-D-proven for stage 1
     "warmup_steps": 200,
@@ -211,34 +215,49 @@ from transformers import AutoTokenizer
 
 tokenizer = AutoTokenizer.from_pretrained(CFG["tokenizer_id"], trust_remote_code=True)
 
-N_SEQS = CFG["num_train_seqs"] + CFG["num_eval_seqs"]
-tokens_needed = N_SEQS * T * K
+def stream_seqs(name, config, text_field, n_seqs, min_len=50):
+    """Stream a HF dataset into (n_seqs, T, K) int32 chunk sequences."""
+    kwargs = {"split": "train", "streaming": True}
+    if config:
+        kwargs["name"] = config
+    ds, buf, total = load_dataset(name, **kwargs), [], 0
+    need = n_seqs * T * K
+    for ex in ds:
+        text = ex.get(text_field, "")
+        if not text or len(text) < min_len:
+            continue
+        ids = [i for i in tokenizer.encode(text, max_length=512, truncation=True)
+               if i < CFG["vocab_size"]]
+        buf.append(np.asarray(ids, dtype=np.int32))
+        total += len(ids)
+        if total >= need:
+            break
+    flat = np.concatenate(buf)[: (need // (T * K)) * T * K]
+    return flat.reshape(-1, T, K)
 
-stream, buf = load_dataset("roneneldan/TinyStories", split="train", streaming=True), []
-total = 0
-for ex in stream:
-    text = ex.get("text", "")
-    if len(text) < 50:
-        continue
-    ids = tokenizer.encode(text, max_length=512, truncation=True)
-    ids = [i for i in ids if i < CFG["vocab_size"]]
-    buf.append(np.asarray(ids, dtype=np.int32))
-    total += len(ids)
-    if total >= tokens_needed:
-        break
 
-flat = np.concatenate(buf)[: (tokens_needed // (T * K)) * T * K]
-seqs_np = flat.reshape(-1, T, K)
-# FIXED eval set: the first num_eval_seqs sequences in stream order, BEFORE
-# any permutation. This keeps eval (and the oracle bar) identical across
-# sessions and data-scale changes — run 4 vs 5 were not comparable because
-# the shuffled split moved with num_train_seqs.
 n_ev = CFG["num_eval_seqs"]
-eval_seqs = jnp.asarray(seqs_np[:n_ev])
+n_wiki = int(CFG["num_train_seqs"] * CFG["wiki_fraction"])
+n_ts = CFG["num_train_seqs"] - n_wiki + n_ev
+
+ts_seqs = stream_seqs("roneneldan/TinyStories", None, "text", n_ts)
+# FIXED eval set: the first num_eval_seqs TinyStories sequences in stream
+# order, BEFORE any permutation or mixing — identical across sessions,
+# data scales, and mix ratios, so all baselines/oracle bars stay comparable.
+eval_seqs = jnp.asarray(ts_seqs[:n_ev])
+
+train_pool = ts_seqs[n_ev:]
+if n_wiki > 0:
+    wiki_seqs = stream_seqs("wikitext", "wikitext-103-raw-v1", "text", n_wiki)
+    train_pool = np.concatenate([train_pool, wiki_seqs], axis=0)
+    print(f"mix: {train_pool.shape[0] - wiki_seqs.shape[0]:,} TinyStories + "
+          f"{wiki_seqs.shape[0]:,} wikitext sequences")
+
 rng = np.random.default_rng(CFG["seed"])
-rest = seqs_np[n_ev:]
-train_seqs = jnp.asarray(rest[rng.permutation(rest.shape[0])][: CFG["num_train_seqs"]])
-print(f"train {train_seqs.shape}, eval {eval_seqs.shape} (fixed, stream-order)")
+train_seqs = jnp.asarray(
+    train_pool[rng.permutation(train_pool.shape[0])][: CFG["num_train_seqs"]])
+print(f"train {train_seqs.shape} (~{train_seqs.size:,} tokens), "
+      f"eval {eval_seqs.shape} (fixed, pure TinyStories)")
 
 # %% [markdown]
 # ## 5 · AE sanity + precompute latents
@@ -512,7 +531,8 @@ import json
 STAGE2 = CFG["objective"] != "mse"
 stage_total = CFG["stage2_steps"] if STAGE2 else CFG["total_steps"]
 stage_peak = CFG["stage2_lr"] if STAGE2 else CFG["peak_lr"]
-stage_tag = "_s2" if STAGE2 else ""
+RUNV = CFG["run_version"]
+stage_tag = f"_{RUNV}" + ("_s2" if STAGE2 else "")
 
 schedule = optax.warmup_cosine_decay_schedule(
     init_value=0.0,
@@ -530,7 +550,7 @@ opt_state = opt.init(params)
 # ── full training-state resume ────────────────────────────────────────
 STATE_FILE = os.path.join(CKPT_OUT, f"train_state{stage_tag}.eqx")
 STATE_META = os.path.join(CKPT_OUT, f"train_state{stage_tag}.json")
-S1_STATE = os.path.join(CKPT_OUT, "train_state.eqx")
+S1_STATE = os.path.join(CKPT_OUT, f"train_state_{RUNV}.eqx")
 global_step = 0
 if os.path.exists(STATE_FILE) and os.path.exists(STATE_META):
     try:
@@ -563,9 +583,11 @@ def train_step(p, o, batch, bz, skey):
 
 def save_ckpt(p, tag):
     m = eqx.combine(p, static)
-    eqx.tree_serialise_leaves(os.path.join(CKPT_OUT, f"backbone_hybrid_{tag}.eqx"), m["backbone"])
-    eqx.tree_serialise_leaves(os.path.join(CKPT_OUT, f"energy_head_hybrid_{tag}.eqx"), m["head"])
-    eqx.tree_serialise_leaves(os.path.join(CKPT_OUT, f"direct_head_hybrid_{tag}.eqx"), m["direct"])
+    for comp, fname in [("backbone", "backbone_hybrid"),
+                        ("head", "energy_head_hybrid"),
+                        ("direct", "direct_head_hybrid")]:
+        eqx.tree_serialise_leaves(
+            os.path.join(CKPT_OUT, f"{fname}_{RUNV}_{tag}.eqx"), m[comp])
 
 
 def save_state(p, o, gs):
