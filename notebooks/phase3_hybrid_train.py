@@ -305,6 +305,23 @@ head = EnergyHead(
 key, kd = jax.random.split(key)
 direct = eqx.nn.Linear(CFG["dim"], CFG["latent_dim"], key=kd)
 model = {"backbone": backbone, "head": head, "direct": direct}
+
+# resume from a previous run's checkpoints if present (delete the files or
+# set RESUME=False to start fresh). The direct head is new in run 2; missing
+# checkpoints are skipped gracefully.
+RESUME = True
+if RESUME:
+    for name, tag in [("backbone", "backbone_hybrid_best.eqx"),
+                      ("head", "energy_head_hybrid_best.eqx"),
+                      ("direct", "direct_head_hybrid_best.eqx")]:
+        pth = os.path.join(CKPT_OUT, tag)
+        if os.path.exists(pth):
+            try:
+                model[name] = eqx.tree_deserialise_leaves(pth, model[name])
+                print(f"✓ resumed {name} from {tag}")
+            except Exception as e:
+                print(f"⚠️  {tag} incompatible ({type(e).__name__}) — fresh init")
+
 params, static = eqx.partition(model, eqx.is_inexact_array)
 n_params = sum(x.size for x in jax.tree.leaves(params))
 print(f"trainable params: {n_params:,}")
@@ -371,13 +388,20 @@ def eval_metrics(p, seqs, zs, mkey):
         d_cos = jnp.sum(d_pred * z_tgt, axis=-1) / (
             jnp.linalg.norm(d_pred, axis=-1) * jnp.linalg.norm(z_tgt, axis=-1) + 1e-8
         )
+        # centered cosine: subtract the global mean latent first. All latents
+        # share a dominant direction, so plain cosine is ~blind to context;
+        # in centered space the unconditional predictor scores exactly 0.
+        pc, tc = d_pred - z_mean, z_tgt - z_mean
+        c_cos = jnp.sum(pc * tc, axis=-1) / (
+            jnp.linalg.norm(pc, axis=-1) * jnp.linalg.norm(tc, axis=-1) + 1e-8
+        )
         # diversity: how much predictions vary across positions vs targets
         div = jnp.mean(jnp.std(preds, axis=0)) / (jnp.mean(jnp.std(z_tgt, axis=0)) + 1e-8)
-        return jnp.mean(es), jnp.mean(cos), jnp.mean(d_cos), div
+        return jnp.mean(es), jnp.mean(cos), jnp.mean(d_cos), jnp.mean(c_cos), div
 
     keys = jax.random.split(mkey, seqs.shape[0])
-    es, cos, dcos, div = jax.vmap(per_seq)(seqs, zs, keys)
-    return jnp.mean(es), jnp.mean(cos), jnp.mean(dcos), jnp.mean(div)
+    es, cos, dcos, ccos, div = jax.vmap(per_seq)(seqs, zs, keys)
+    return jnp.mean(es), jnp.mean(cos), jnp.mean(dcos), jnp.mean(ccos), jnp.mean(div)
 
 
 # %% [markdown]
@@ -408,6 +432,7 @@ def save_ckpt(p, tag):
     m = eqx.combine(p, static)
     eqx.tree_serialise_leaves(os.path.join(CKPT_OUT, f"backbone_hybrid_{tag}.eqx"), m["backbone"])
     eqx.tree_serialise_leaves(os.path.join(CKPT_OUT, f"energy_head_hybrid_{tag}.eqx"), m["head"])
+    eqx.tree_serialise_leaves(os.path.join(CKPT_OUT, f"direct_head_hybrid_{tag}.eqx"), m["direct"])
 
 
 best_loss, hist = float("inf"), []
@@ -419,16 +444,17 @@ for step in range(CFG["steps"]):
     params, opt_state, loss = train_step(params, opt_state, train_seqs[idx], train_z[idx], sk)
     if step % CFG["eval_every"] == 0 or step == CFG["steps"] - 1:
         dk, mk = jax.random.split(dk)
-        es, cos, dcos, div = eval_metrics(params, eval_seqs, eval_z, mk)
-        es, cos, dcos, div = float(es), float(cos), float(dcos), float(div)
-        hist.append((step, time.time() - t0, es, cos, dcos, div))
+        es, cos, dcos, ccos, div = eval_metrics(params, eval_seqs, eval_z, mk)
+        es, cos, dcos, ccos, div = (float(es), float(cos), float(dcos),
+                                    float(ccos), float(div))
+        hist.append((step, time.time() - t0, es, cos, dcos, div, ccos))
         marker = ""
         if es < best_loss:
             best_loss = es
             save_ckpt(params, "best")
             marker = "  ← best (saved)"
         print(f"[{step:5d}] train {float(loss):.4f}  eval {es:.4f}  "
-              f"cos {cos:.3f}/direct {dcos:.3f} (uncond {uncond_cos_base:.3f})  "
+              f"cos {cos:.3f}/direct {dcos:.3f}  centered {ccos:.3f}  "
               f"div {div:.2f}{marker}")
     if step and step % CFG["ckpt_every"] == 0:
         save_ckpt(params, "latest")
@@ -456,78 +482,129 @@ axes[1].axhline(uncond_cos_base, color="red", ls="--",
 axes[1].axhline(copy_cos_base, color="gray", ls=":", label="copy cos")
 axes[1].set(xlabel="step", ylabel="cosine similarity", title="Latent prediction quality")
 axes[1].legend()
-axes[2].plot(steps_h, [h[5] for h in hist], lw=2, color="tab:green")
-axes[2].axhline(1.0, color="gray", ls="--", label="target diversity")
-axes[2].axhline(0.2, color="red", ls=":", label="collapse threshold")
-axes[2].set(xlabel="step", ylabel="pred std / target std",
-            title="Prediction diversity (collapse detector)")
-axes[2].legend()
+ax2b = axes[2]
+ax2b.plot(steps_h, [h[5] for h in hist], lw=2, color="tab:green", label="diversity")
+ax2b.plot(steps_h, [h[6] for h in hist], lw=2, color="tab:purple",
+          label="centered cos (0 = no context)")
+ax2b.axhline(1.0, color="gray", ls="--", label="target diversity")
+ax2b.axhline(0.2, color="red", ls=":", label="collapse threshold")
+ax2b.axhline(0.0, color="black", lw=0.5)
+ax2b.set(xlabel="step", title="Context signal: diversity + centered cosine")
+ax2b.legend()
 plt.tight_layout(); plt.show()
 
 # %% [markdown]
-# ## 10 · Decode demo: predicted latents → text
+# ## 10 · Decoded token accuracy
 #
-# For a few eval positions: generate a next-latent sample, push it through the
-# frozen AE decoder, and compare the decoded chunk with the ground truth.
-# Early in training expect gibberish-adjacent text; watch for topical/local
-# coherence emerging.
+# Direct-head predictions decoded through the AE, token-level top-1 accuracy
+# vs the true next chunk. Random ≈ 0; the marginal-mean predictor lands on
+# frequent-token soup. Any stable value above the uncond row is real
+# contextual signal in *token* space — a much stricter test than cosine.
 
 # %%
 m = eqx.combine(params, static)
-bb, hd = m["backbone"], m["head"]
+bb, hd, dr = m["backbone"], m["head"], m["direct"]
+
+N_ACC = 32  # eval sequences to score (decode is vocab-wide, keep it bounded)
+
+@eqx.filter_jit
+def decoded_token_acc(seq_tokens, seq_z):
+    embs = AE_EMB[seq_tokens]
+    inp = jax.vmap(bb.compress_input)(embs)
+    hid, _ = bb(inp)
+    z_pred = jax.vmap(dr)(hid[:-1])                       # (T-1, latent)
+    logits = jax.vmap(frozen_ae.decode)(z_pred)           # (T-1, K, vocab)
+    pred_tok = jnp.argmax(logits, axis=-1)
+    return jnp.mean(pred_tok == seq_tokens[1:])
+
+acc_model = float(jnp.mean(jax.vmap(decoded_token_acc)(eval_seqs[:N_ACC], eval_z[:N_ACC])))
+uncond_tok = jnp.argmax(frozen_ae.decode(z_mean), axis=-1)
+acc_uncond = float(jnp.mean(uncond_tok[None, None, :] == eval_seqs[:N_ACC, 1:]))
+print(f"decoded token accuracy — model: {acc_model:.4f}   uncond-mean: {acc_uncond:.4f}")
+
+# %% [markdown]
+# ## 11 · Decode demo: raw + nearest-neighbor snap
+#
+# Raw AE decode of an off-manifold prediction is expected to be token soup at
+# this compute scale — CALM-quality text sits ~5 orders of magnitude away in
+# data/params. The **NN-snap** row projects the prediction onto the manifold
+# (nearest training latent by cosine) and decodes *that* chunk's actual text:
+# it shows what the prediction points at semantically, even when the raw
+# decode is unreadable. Watch NN-snap for topical relevance first.
+
+# %%
+# latent bank for NN-snap (subsample of train chunks)
+BANK_N = 40000
+bank_z = train_z[: BANK_N // T + 1].reshape(-1, CFG["latent_dim"])[:BANK_N]
+bank_tokens = train_seqs[: BANK_N // T + 1].reshape(-1, K)[:BANK_N]
+bank_norm = bank_z / (jnp.linalg.norm(bank_z, axis=-1, keepdims=True) + 1e-8)
+
+def nn_snap(z):
+    zn = z / (jnp.linalg.norm(z) + 1e-8)
+    idx = int(jnp.argmax(bank_norm @ zn))
+    return tokenizer.decode(np.asarray(bank_tokens[idx]))
+
+
 demo_seq = eval_seqs[0]
-demo_z = eval_z[0]
 embs = AE_EMB[demo_seq]
 inp = jax.vmap(bb.compress_input)(embs)
 hid, _ = bb(inp)
 
-dr = m["direct"]
 demo_key = jax.random.PRNGKey(0)
 for t in [8, 24, 48]:
     dk1, demo_key = jax.random.split(demo_key)
     z_pred = hd.predict(hid[t], key=dk1)
-    pred_tokens = jnp.argmax(frozen_ae.decode(z_pred), axis=-1)
     z_direct = dr(hid[t])
+    pred_tokens = jnp.argmax(frozen_ae.decode(z_pred), axis=-1)
     direct_tokens = jnp.argmax(frozen_ae.decode(z_direct), axis=-1)
     ctx = tokenizer.decode(np.asarray(demo_seq[max(0, t - 3): t + 1]).reshape(-1))
     truth = tokenizer.decode(np.asarray(demo_seq[t + 1]))
     print(f"── position {t} ────────────────────────────")
     print(f"  context …{ctx!r}")
     print(f"  truth        {truth!r}")
-    print(f"  energy-head  {tokenizer.decode(np.asarray(pred_tokens))!r}")
-    print(f"  direct-head  {tokenizer.decode(np.asarray(direct_tokens))!r}\n")
-# If both heads print the SAME text for different positions, the model is
-# ignoring context — check the diversity plot above.
+    print(f"  energy raw   {tokenizer.decode(np.asarray(pred_tokens))!r}")
+    print(f"  direct raw   {tokenizer.decode(np.asarray(direct_tokens))!r}")
+    print(f"  energy NN⇒   {nn_snap(z_pred)!r}")
+    print(f"  direct NN⇒   {nn_snap(z_direct)!r}\n")
+# If rows repeat verbatim across positions, the model is ignoring context —
+# check the diversity/centered-cosine plot above.
 
 # %% [markdown]
-# ## 11 · Verdict
+# ## 12 · Verdict
+#
+# Judged on **context signal**, not text quality — readable decode at this
+# compute scale is not a fair criterion (CALM operates ~5 orders of magnitude
+# higher). Centered cosine and decoded token accuracy are the honest yardsticks:
+# both are exactly-zero-ish for any unconditional predictor.
 
 # %%
 final_cos, final_dcos, final_div = hist[-1][3], hist[-1][4], hist[-1][5]
-best_cos = max(max(h[3] for h in hist), max(h[4] for h in hist))
+final_ccos = hist[-1][6]
+best_ccos = max(h[6] for h in hist)
 print("=" * 64)
 print(f"  best eval energy   : {best_loss:.4f}")
 print(f"  copy baseline      : {baseline_copy:.4f}   cos {copy_cos_base:.3f}")
 print(f"  uncond baseline    : {baseline_uncond:.4f}   cos {uncond_cos_base:.3f}")
 print(f"  final cos          : energy-head {final_cos:.3f} / direct {final_dcos:.3f}")
+print(f"  centered cos       : {final_ccos:.3f}  (best {best_ccos:.3f}; uncond = 0)")
+print(f"  decoded token acc  : model {acc_model:.4f} vs uncond {acc_uncond:.4f}")
 print(f"  prediction diversity: {final_div:.2f}  (1.0 = target-like, <0.2 = collapsed)")
 print("=" * 64)
 
-CONTEXT_MARGIN = 0.05  # must beat unconditional cosine by this much
 if final_div < 0.2:
-    print("❌ COLLAPSED — predictions barely vary with context; the model is "
-          "an unconditional latent sampler. Raise aux_weight, extend budget, "
-          "or scale data before re-judging.")
-elif best_loss < baseline_uncond and best_cos > uncond_cos_base + CONTEXT_MARGIN:
-    print("✅ Phase 3 core objective met — genuinely *contextual* next-latent "
-          "prediction (beats the unconditional predictor on both energy and "
-          "cosine, no collapse). Next: scale (dim/layers/data), then qTTT + CIB.")
-elif best_loss < baseline_uncond:
-    print("🟡 WEAK CONTEXT — beats the unconditional baseline on energy but "
-          "not clearly on cosine. Some context signal, mostly marginal "
-          "distribution. More data/steps is the first lever (next-chunk "
-          "latents have high irreducible entropy; contextual structure "
-          "emerges with scale).")
+    print("❌ COLLAPSED — predictions barely vary with context. Raise "
+          "aux_weight, extend budget, or scale data before re-judging.")
+elif best_loss < baseline_uncond and best_ccos >= 0.10 and acc_model > acc_uncond:
+    print("✅ CONTEXTUAL SIGNAL CONFIRMED — beats the unconditional predictor "
+          "on energy, centered cosine, and decoded tokens. The hybrid VELM "
+          "loop works; quality is now a scaling question (data → params → "
+          "steps, in that order). Then qTTT + CIB.")
+elif best_loss < baseline_uncond and (best_ccos > 0.03 or acc_model > acc_uncond):
+    print("🟡 WEAK BUT REAL CONTEXT — small positive centered-cosine/token "
+          "signal above the unconditional floor. First lever: more data "
+          "(10–50M tokens, streaming) and steps; then model width. Track "
+          "centered cos across runs — it should grow with scale.")
 else:
-    print("❌ Not beating the unconditional baseline — check LR/budget "
-          "before scaling.")
+    print("❌ No measurable context signal — the model is a marginal-"
+          "distribution sampler. Investigate conditioning (aux_weight, "
+          "backbone capacity, LR) before scaling.")
