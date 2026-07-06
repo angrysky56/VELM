@@ -118,8 +118,18 @@ CFG = {
     "ae_hidden_dim": 384,          # gpu_12gb_v2
     "ae_ffn_intermediate": 768,
     "latent_dim": 128,
-    # ── data (v3 scale-up: the 4th scaling-law point) ─────
-    "run_version": "v3",           # versions state/ckpt files; v1/v2 untouched
+    # ── RUN: v3l2 — the "thinking" ablation ───────────────
+    # v3 result: scaling curve bent (0.167→0.218→0.306→0.314): the model is
+    # now capacity-limited, not data-limited. This run tests RECURRENT DEPTH
+    # (Mythos RDT n_loops=2): same parameters, twice the sequential compute
+    # per chunk. v3 weights load directly into the 2-loop skeleton
+    # (init_from_version) and finetune for one session. If ccos moves,
+    # latent-space iteration pays at fixed params; if not, width (dim 384)
+    # is the next lever.
+    "run_version": "v3l2",         # versions state/ckpt files
+    "n_loops": 2,                  # recurrent depth (v1–v3 ran 1)
+    "init_from_version": "v3",     # seed stage-1 params from this run's state
+    "data_version": "v3",          # reuse v3's token/latent caches (same data)
     "seq_len": 64,                 # chunks per sequence (256 tokens)
     "num_train_seqs": 262144,      # ~64M tokens (4× v2, 16× v1)
     "num_eval_seqs": 128,
@@ -173,11 +183,10 @@ CFG = {
     # session_steps and saves the FULL training state (params + optimizer
     # moments + global step), so resuming continues the schedule instead of
     # re-warming up over trained weights (run 5's fatal mistake).
-    # v3: 64M tokens → 64k steps ≈ 2 epochs (8 sessions). v1 lesson stands:
-    # contextual gains accrue as LR decays; one cosine cycle over the budget.
-    "total_steps": 64000,
+    # v3l2: finetune cycle — one session, warm-started from v3
+    "total_steps": 8000,
     "session_steps": 8000,
-    "peak_lr": 1e-3,               # arm-D-proven for stage 1
+    "peak_lr": 3e-4,               # finetune LR (1e-3 for from-scratch runs)
     "warmup_steps": 200,
     "weight_decay": 0.0,           # arm D ran wd 0; decay added nothing
     "grad_clip": 1.0,
@@ -186,6 +195,7 @@ CFG = {
 }
 K, T = CFG["chunk_k"], CFG["seq_len"]
 RUNV = CFG["run_version"]
+DATAV = CFG.get("data_version", RUNV)
 key = jax.random.PRNGKey(CFG["seed"])
 
 # %% [markdown]
@@ -231,7 +241,7 @@ from transformers import AutoTokenizer
 
 tokenizer = AutoTokenizer.from_pretrained(CFG["tokenizer_id"], trust_remote_code=True)
 
-TOK_CACHE = os.path.join(CKPT_OUT, f"poc_tokens_{RUNV}.npz")
+TOK_CACHE = os.path.join(CKPT_OUT, f"poc_tokens_{DATAV}.npz")
 if os.path.exists(TOK_CACHE):
     _t = np.load(TOK_CACHE)
     train_seqs, eval_seqs = _t["train"], jnp.asarray(_t["evals"])
@@ -328,7 +338,7 @@ def encode_all_np(seqs_np, bs=256):
     return np.concatenate(outs, axis=0)
 
 
-LAT_CACHE = os.path.join(CKPT_OUT, f"poc_latents_{RUNV}.npy")
+LAT_CACHE = os.path.join(CKPT_OUT, f"poc_latents_{DATAV}.npy")
 t0 = time.time()
 if os.path.exists(LAT_CACHE):
     train_z = np.load(LAT_CACHE)  # raw latents, host RAM
@@ -461,6 +471,8 @@ backbone = VELMBackbone(
     ffn_intermediate=CFG["ffn_intermediate"],
     chunk_size=K,
     ae_hidden_dim=CFG["ae_hidden_dim"],
+    n_loops=CFG["n_loops"],   # recurrent depth — static, so weights from an
+    #                           n_loops=1 run load directly into this skeleton
     key=kb,
 )
 head = EnergyHead(
@@ -651,6 +663,19 @@ elif STAGE2 and os.path.exists(S1_STATE):
     params = restored["params"]
     print(f"✓ {CFG['objective']} start: seeded from stage-1 params, "
           "fresh optimizer + LR cycle")
+elif not STAGE2 and CFG.get("init_from_version"):
+    # warm-start a NEW stage-1 run (e.g., the n_loops ablation) from another
+    # run's trained params; fresh optimizer + LR cycle
+    src_state = os.path.join(
+        CKPT_OUT, f"train_state_{CFG['init_from_version']}.eqx")
+    if os.path.exists(src_state):
+        restored = eqx.tree_deserialise_leaves(
+            src_state, {"params": params, "opt_state": opt_state})
+        params = restored["params"]
+        print(f"✓ warm-started params from {CFG['init_from_version']} "
+              f"(n_loops now {CFG['n_loops']}), fresh optimizer")
+    else:
+        print(f"⚠️  init_from state {src_state} not found — fresh start")
 else:
     print("no train_state found — fresh start (global step 0)")
 

@@ -88,7 +88,8 @@ CFG = {
     "bank_seqs": 256,       # extra sequences for the manifold-snap bank
     #   (disjoint from eval rollout sequences — no answer leakage)
     # which checkpoint set to load (newest first)
-    "ckpt_versions": ["v2_best", "v2_final", "best", "final"],
+    "ckpt_versions": ["v3l2_best", "v3l2_final", "v3_best", "v3_final",
+                      "v2_best", "v2_final", "best", "final"],
 }
 K, T, LAT = CFG["chunk_k"], CFG["seq_len"], CFG["latent_dim"]
 
