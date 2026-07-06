@@ -141,7 +141,7 @@ else:
     CURRICULUM = [
         {"name": "open-web-math/open-web-math", "weight": 0.5, "label": "math",
          "split": "train", "text_field": "text"},
-        {"name": "wikitext", "config": "wikitext-103-raw-v1", "weight": 0.3,
+        {"name": "Salesforce/wikitext", "config": "wikitext-103-raw-v1", "weight": 0.3,
          "label": "general", "split": "train", "text_field": "text"},
         {"name": "roneneldan/TinyStories", "weight": 0.2, "label": "narrative",
          "split": "train", "text_field": "text"},

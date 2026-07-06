@@ -31,7 +31,7 @@ DEFAULT_CURRICULUM: list[dict] = [
         "label": "math",
     },
     {
-        "name": "wikitext",
+        "name": "Salesforce/wikitext",
         "config": "wikitext-103-raw-v1",
         "split": "train",
         "text_key": "text",

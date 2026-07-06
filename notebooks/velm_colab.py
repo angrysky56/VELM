@@ -224,7 +224,7 @@ else:
             "text_field": "text",
         },
         {
-            "name": "wikitext",
+            "name": "Salesforce/wikitext",
             "config": "wikitext-103-raw-v1",
             "weight": 0.3,
             "label": "general",

@@ -5,6 +5,8 @@
 #     text_representation:
 #       extension: .py
 #       format_name: percent
+#       format_version: '1.3'
+#       jupytext_version: 1.19.1
 #   kernelspec:
 #     display_name: Python 3
 #     language: python
@@ -248,7 +250,7 @@ eval_seqs = jnp.asarray(ts_seqs[:n_ev])
 
 train_pool = ts_seqs[n_ev:]
 if n_wiki > 0:
-    wiki_seqs = stream_seqs("wikitext", "wikitext-103-raw-v1", "text", n_wiki)
+    wiki_seqs = stream_seqs("Salesforce/wikitext", "wikitext-103-raw-v1", "text", n_wiki)
     train_pool = np.concatenate([train_pool, wiki_seqs], axis=0)
     print(f"mix: {train_pool.shape[0] - wiki_seqs.shape[0]:,} TinyStories + "
           f"{wiki_seqs.shape[0]:,} wikitext sequences")
