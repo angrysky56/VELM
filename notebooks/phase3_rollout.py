@@ -332,6 +332,17 @@ print(tokenizer.decode(toks_es[S:].reshape(-1)))
 # These are the honest rollout-quality numbers to track across scaling runs.
 
 # %%
+# self-contained: regenerate the demo rollouts if section 5 wasn't run
+# in this kernel session
+if "true_cont" not in globals():
+    demo = eval_seqs[0]
+    _, toks_d = rollout(demo, "direct", jax.random.PRNGKey(0))
+    _, toks_e = rollout(demo, "energy", jax.random.PRNGKey(1))
+    _, toks_ds = rollout(demo, "direct", jax.random.PRNGKey(0), snap=True)
+    _, toks_es = rollout(demo, "energy", jax.random.PRNGKey(1), snap=True)
+    true_cont = tokenizer.decode(np.asarray(demo[S: S + R]).reshape(-1))
+    print("(regenerated demo rollouts)")
+
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer as HFTok
 
