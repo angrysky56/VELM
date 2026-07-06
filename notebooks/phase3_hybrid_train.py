@@ -118,16 +118,20 @@ CFG = {
     "ae_hidden_dim": 384,          # gpu_12gb_v2
     "ae_ffn_intermediate": 768,
     "latent_dim": 128,
-    # ── data (v2 scale-up) ────────────────────────────────
-    "run_version": "v2",           # versions state/ckpt files; v1 files untouched
+    # ── data (v3 scale-up: the 4th scaling-law point) ─────
+    "run_version": "v3",           # versions state/ckpt files; v1/v2 untouched
     "seq_len": 64,                 # chunks per sequence (256 tokens)
-    "num_train_seqs": 65536,       # ~16M tokens (4× v1)
+    "num_train_seqs": 262144,      # ~64M tokens (4× v2, 16× v1)
     "num_eval_seqs": 128,
     "wiki_fraction": 0.25,         # train-mix fraction from wikitext-103
-    #   (AE trained on math/wiki/tinystories → wiki is in-distribution;
-    #    eval stays PURE TinyStories first-128 stream order, so baselines,
-    #    oracle bar, and centered-cos stay comparable to v1 runs)
-    "batch_size": 8,               # halves gradient noise; A100/T4 both fine
+    #   (eval stays PURE TinyStories first-128 stream order, so baselines,
+    #    oracle bar, and centered-cos stay comparable to v1/v2 runs)
+    "batch_size": 8,
+    "cache_data": True,            # cache tokens+latents to Drive (~9GB);
+    #   falls back to recompute if the save fails (Drive quota)
+    # v3 NOTE: train tokens+latents now live in HOST RAM (≈9GB numpy) and
+    # batches are moved to device per step — the arrays no longer fit
+    # comfortably GPU-resident. Requires a High-RAM runtime.
     # ── trainable model ───────────────────────────────────
     "dim": 256,
     "num_heads": 8,
@@ -169,9 +173,9 @@ CFG = {
     # session_steps and saves the FULL training state (params + optimizer
     # moments + global step), so resuming continues the schedule instead of
     # re-warming up over trained weights (run 5's fatal mistake).
-    # v2: 4× data → longer cycle (4 sessions). v1 lesson stands: contextual
-    # gains accrue as LR decays; keep the full cosine cycle over the budget.
-    "total_steps": 32000,
+    # v3: 64M tokens → 64k steps ≈ 2 epochs (8 sessions). v1 lesson stands:
+    # contextual gains accrue as LR decays; one cosine cycle over the budget.
+    "total_steps": 64000,
     "session_steps": 8000,
     "peak_lr": 1e-3,               # arm-D-proven for stage 1
     "warmup_steps": 200,
@@ -181,6 +185,7 @@ CFG = {
     "ckpt_every": 1000,
 }
 K, T = CFG["chunk_k"], CFG["seq_len"]
+RUNV = CFG["run_version"]
 key = jax.random.PRNGKey(CFG["seed"])
 
 # %% [markdown]
@@ -226,6 +231,13 @@ from transformers import AutoTokenizer
 
 tokenizer = AutoTokenizer.from_pretrained(CFG["tokenizer_id"], trust_remote_code=True)
 
+TOK_CACHE = os.path.join(CKPT_OUT, f"poc_tokens_{RUNV}.npz")
+if os.path.exists(TOK_CACHE):
+    _t = np.load(TOK_CACHE)
+    train_seqs, eval_seqs = _t["train"], jnp.asarray(_t["evals"])
+    print(f"✓ loaded cached tokens: train {train_seqs.shape} (host RAM)")
+
+
 def stream_seqs(name, config, text_field, n_seqs, min_len=50):
     """Stream a HF dataset into (n_seqs, T, K) int32 chunk sequences."""
     kwargs = {"split": "train", "streaming": True}
@@ -247,27 +259,37 @@ def stream_seqs(name, config, text_field, n_seqs, min_len=50):
     return flat.reshape(-1, T, K)
 
 
-n_ev = CFG["num_eval_seqs"]
-n_wiki = int(CFG["num_train_seqs"] * CFG["wiki_fraction"])
-n_ts = CFG["num_train_seqs"] - n_wiki + n_ev
+if not os.path.exists(TOK_CACHE):
+    n_ev = CFG["num_eval_seqs"]
+    n_wiki = int(CFG["num_train_seqs"] * CFG["wiki_fraction"])
+    n_ts = CFG["num_train_seqs"] - n_wiki + n_ev
 
-ts_seqs = stream_seqs("roneneldan/TinyStories", None, "text", n_ts)
-# FIXED eval set: the first num_eval_seqs TinyStories sequences in stream
-# order, BEFORE any permutation or mixing — identical across sessions,
-# data scales, and mix ratios, so all baselines/oracle bars stay comparable.
-eval_seqs = jnp.asarray(ts_seqs[:n_ev])
+    ts_seqs = stream_seqs("roneneldan/TinyStories", None, "text", n_ts)
+    # FIXED eval set: the first num_eval_seqs TinyStories sequences in stream
+    # order, BEFORE any permutation or mixing — identical across sessions,
+    # data scales, and mix ratios, so baselines/oracle bars stay comparable.
+    eval_seqs = jnp.asarray(ts_seqs[: n_ev])
 
-train_pool = ts_seqs[n_ev:]
-if n_wiki > 0:
-    wiki_seqs = stream_seqs("Salesforce/wikitext", "wikitext-103-raw-v1", "text", n_wiki)
-    train_pool = np.concatenate([train_pool, wiki_seqs], axis=0)
-    print(f"mix: {train_pool.shape[0] - wiki_seqs.shape[0]:,} TinyStories + "
-          f"{wiki_seqs.shape[0]:,} wikitext sequences")
+    train_pool = ts_seqs[n_ev:]
+    if n_wiki > 0:
+        wiki_seqs = stream_seqs("Salesforce/wikitext", "wikitext-103-raw-v1",
+                                "text", n_wiki)
+        train_pool = np.concatenate([train_pool, wiki_seqs], axis=0)
+        print(f"mix: {train_pool.shape[0] - wiki_seqs.shape[0]:,} TinyStories + "
+              f"{wiki_seqs.shape[0]:,} wikitext sequences")
 
-rng = np.random.default_rng(CFG["seed"])
-train_seqs = jnp.asarray(
-    train_pool[rng.permutation(train_pool.shape[0])][: CFG["num_train_seqs"]])
-print(f"train {train_seqs.shape} (~{train_seqs.size:,} tokens), "
+    rng = np.random.default_rng(CFG["seed"])
+    # v3: train tokens stay in HOST RAM (numpy); batches device-put per step
+    train_seqs = np.ascontiguousarray(
+        train_pool[rng.permutation(train_pool.shape[0])][: CFG["num_train_seqs"]])
+    if CFG["cache_data"]:
+        try:
+            np.savez(TOK_CACHE, train=train_seqs, evals=np.asarray(eval_seqs))
+            print(f"✓ cached tokens → {TOK_CACHE}")
+        except Exception as e:
+            print(f"⚠️  token cache save failed ({type(e).__name__}) — continuing")
+
+print(f"train {train_seqs.shape} (~{train_seqs.size:,} tokens, host RAM), "
       f"eval {eval_seqs.shape} (fixed, pure TinyStories)")
 
 # %% [markdown]
@@ -288,22 +310,40 @@ def encode_seq(seq_tokens):
 # measured on its training mix (math/wikitext/TinyStories); pure TinyStories
 # with occasional rare tokens sits slightly lower. A true config mismatch
 # would score near zero, so 0.95 is a safe gate.
-sample = train_seqs[:16].reshape(-1, K)
+sample = jnp.asarray(train_seqs[:16].reshape(-1, K))
 recon = jax.vmap(frozen_ae.reconstruct)(sample)
 acc = float(jnp.mean(recon == sample))
 print(f"AE roundtrip accuracy on {sample.shape[0]} chunks: {acc:.4f}")
 assert acc >= 0.95, "AE checkpoint/config mismatch — check ae dims in CFG"
 
-def encode_all(seqs, bs=64):
-    outs = []
-    for i in range(0, seqs.shape[0], bs):
-        outs.append(jax.vmap(encode_seq)(seqs[i: i + bs]))
-    return jnp.concatenate(outs, axis=0)
 
+def encode_all_np(seqs_np, bs=256):
+    """Encode to HOST-RAM numpy in device-sized bites (v3: ~9GB output)."""
+    outs = []
+    for i in range(0, seqs_np.shape[0], bs):
+        z = jax.vmap(encode_seq)(jnp.asarray(seqs_np[i: i + bs]))
+        outs.append(np.asarray(z))
+        if (i // bs) % 200 == 0:
+            print(f"  encoding… {i:,}/{seqs_np.shape[0]:,}", end="\r")
+    return np.concatenate(outs, axis=0)
+
+
+LAT_CACHE = os.path.join(CKPT_OUT, f"poc_latents_{RUNV}.npy")
 t0 = time.time()
-train_z = encode_all(train_seqs)   # (N, T, latent)
-eval_z = encode_all(eval_seqs)
-print(f"latents: train {train_z.shape}, eval {eval_z.shape}  ({time.time() - t0:.0f}s)")
+if os.path.exists(LAT_CACHE):
+    train_z = np.load(LAT_CACHE)  # raw latents, host RAM
+    print(f"✓ loaded cached latents {train_z.shape}")
+else:
+    train_z = encode_all_np(np.asarray(train_seqs))   # (N, T, latent) host
+    if CFG["cache_data"]:
+        try:
+            np.save(LAT_CACHE, train_z)
+            print(f"✓ cached latents → {LAT_CACHE}")
+        except Exception as e:
+            print(f"⚠️  latent cache save failed ({type(e).__name__}) — continuing")
+eval_z = jax.vmap(encode_seq)(eval_seqs)              # small, device-resident
+print(f"latents: train {train_z.shape} (host), eval {eval_z.shape}  "
+      f"({time.time() - t0:.0f}s)")
 
 # ── STANDARDIZE the latent space (run-4 fix) ──────────────────────────
 # Raw latents carry a dominant shared mean direction; cosine/energy losses
@@ -319,15 +359,18 @@ print(f"latents: train {train_z.shape}, eval {eval_z.shape}  ({time.time() - t0:
 STATS_FILE = os.path.join(CKPT_OUT, "latent_stats.npz")
 if os.path.exists(STATS_FILE):
     _s = np.load(STATS_FILE)
-    z_mu, z_sd = jnp.asarray(_s["mu"]), jnp.asarray(_s["sd"])
+    mu_np, sd_np = _s["mu"], _s["sd"]
     print("✓ loaded frozen latent stats")
 else:
     z_flat = train_z.reshape(-1, CFG["latent_dim"])
-    z_mu = z_flat.mean(axis=0)
-    z_sd = z_flat.std(axis=0) + 1e-6
-    np.savez(STATS_FILE, mu=np.asarray(z_mu), sd=np.asarray(z_sd))
+    mu_np = z_flat.mean(axis=0)
+    sd_np = z_flat.std(axis=0) + 1e-6
+    np.savez(STATS_FILE, mu=mu_np, sd=sd_np)
     print("✓ computed + froze latent stats")
-train_z = (train_z - z_mu) / z_sd
+z_mu, z_sd = jnp.asarray(mu_np), jnp.asarray(sd_np)
+# standardize IN PLACE on host (v3: never materialize a 9GB copy on device)
+train_z -= mu_np
+train_z /= sd_np
 eval_z = (eval_z - z_mu) / z_sd
 print(f"standardized: mean|z| = {float(jnp.mean(jnp.linalg.norm(eval_z, axis=-1))):.2f} "
       f"(sphere radius √{CFG['latent_dim']} = {np.sqrt(CFG['latent_dim']):.2f})")
@@ -351,7 +394,8 @@ def _cos(a, b):
         jnp.linalg.norm(a, axis=-1) * jnp.linalg.norm(b, axis=-1) + 1e-8)
 
 
-z_mean = train_z.reshape(-1, CFG["latent_dim"]).mean(axis=0)  # ≈ 0 (standardized)
+z_mean = jnp.asarray(
+    train_z[:4096].reshape(-1, CFG["latent_dim"]).mean(axis=0))  # ≈ 0 (standardized)
 
 # copy: predict z_t for z_{t+1}
 copy_scores = jax.vmap(
@@ -644,8 +688,10 @@ if n_sess <= 0:
 for i in range(n_sess):
     gs = global_step + i
     dk, bk, sk = jax.random.split(dk, 3)
-    idx = jax.random.randint(bk, (CFG["batch_size"],), 0, train_seqs.shape[0])
-    params, opt_state, loss = train_step(params, opt_state, train_seqs[idx], train_z[idx], sk)
+    idx = np.asarray(
+        jax.random.randint(bk, (CFG["batch_size"],), 0, train_seqs.shape[0]))
+    params, opt_state, loss = train_step(
+        params, opt_state, jnp.asarray(train_seqs[idx]), jnp.asarray(train_z[idx]), sk)
     if i % CFG["eval_every"] == 0 or i == n_sess - 1:
         dk, mk = jax.random.split(dk)
         es, cos, dcos, ccos, div = eval_metrics(params, eval_seqs, eval_z, mk)
@@ -750,8 +796,8 @@ print(f"decoded token accuracy — model: {acc_model:.4f}   uncond-mean: {acc_un
 # %%
 # latent bank for NN-snap (subsample of train chunks)
 BANK_N = 40000
-bank_z = train_z[: BANK_N // T + 1].reshape(-1, CFG["latent_dim"])[:BANK_N]
-bank_tokens = train_seqs[: BANK_N // T + 1].reshape(-1, K)[:BANK_N]
+bank_z = jnp.asarray(train_z[: BANK_N // T + 1].reshape(-1, CFG["latent_dim"])[:BANK_N])
+bank_tokens = jnp.asarray(train_seqs[: BANK_N // T + 1].reshape(-1, K)[:BANK_N])
 bank_norm = bank_z / (jnp.linalg.norm(bank_z, axis=-1, keepdims=True) + 1e-8)
 
 def nn_snap(z):
