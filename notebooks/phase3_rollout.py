@@ -240,6 +240,14 @@ def cos_per_step(preds, true_z):
 
 # %% [markdown]
 # ## 4 · Decay curves
+#
+# **Metric caveat (important):** cosine-to-the-*specific*-true-continuation
+# can only be trusted for ~1–2 steps. Beyond that, any generator — including
+# a perfect one — diverges into a *different valid story* and scores ≈ 0.
+# Teacher-forced stays high only because it is re-anchored to the truth each
+# step. Use these curves for step-1 quality and for detecting *collapse*
+# (sustained negative/degenerate behavior); use §6's plausibility metrics for
+# actual generation quality.
 
 # %%
 S, R = CFG["seed_chunks"], CFG["rollout_steps"]
@@ -310,3 +318,55 @@ print("\n── VELM (direct + manifold snap) ───────────�
 print(tokenizer.decode(toks_ds[S:].reshape(-1)))
 print("\n── VELM (energy + manifold snap) ────────────")
 print(tokenizer.decode(toks_es[S:].reshape(-1)))
+
+# %% [markdown]
+# ## 6 · Plausibility metrics (truth-independent)
+#
+# Two judges that don't care *which* story gets written:
+#
+# - **distilgpt2 NLL/token** — is the text on the language manifold at all?
+#   (lower = more plausible; the true continuation gives the reference level)
+# - **distinct-bigram ratio** — degeneracy detector; loop-babble ("and and
+#   it and") scores near 0, healthy text near 1.
+#
+# These are the honest rollout-quality numbers to track across scaling runs.
+
+# %%
+import torch
+from transformers import AutoModelForCausalLM, AutoTokenizer as HFTok
+
+judge_tok = HFTok.from_pretrained("distilgpt2")
+judge = AutoModelForCausalLM.from_pretrained("distilgpt2").eval()
+if torch.cuda.is_available():
+    judge = judge.cuda()
+
+
+def judge_nll(text):
+    ids = judge_tok.encode(text, return_tensors="pt", truncation=True, max_length=512)
+    if torch.cuda.is_available():
+        ids = ids.cuda()
+    with torch.no_grad():
+        out = judge(ids, labels=ids)
+    return float(out.loss)
+
+
+def distinct_bigrams(token_ids):
+    toks = [int(t) for t in np.asarray(token_ids).reshape(-1)]
+    if len(toks) < 2:
+        return 0.0
+    bigrams = list(zip(toks[:-1], toks[1:]))
+    return len(set(bigrams)) / len(bigrams)
+
+
+rows = [
+    ("true continuation", true_cont, demo[S: S + R]),
+    ("direct raw", tokenizer.decode(toks_d[S:].reshape(-1)), toks_d[S:]),
+    ("energy raw", tokenizer.decode(toks_e[S:].reshape(-1)), toks_e[S:]),
+    ("direct + snap", tokenizer.decode(toks_ds[S:].reshape(-1)), toks_ds[S:]),
+    ("energy + snap", tokenizer.decode(toks_es[S:].reshape(-1)), toks_es[S:]),
+]
+print(f"{'mode':20s} {'judge NLL/token':>16s} {'distinct-2gram':>15s}")
+for name, text, tok_ids in rows:
+    print(f"{name:20s} {judge_nll(text):16.3f} {distinct_bigrams(tok_ids):15.3f}")
+print("\n(judge NLL: lower = more language-like; true continuation is the "
+      "reference. distinct-2gram: near 0 = degenerate looping.)")
