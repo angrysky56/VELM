@@ -53,7 +53,7 @@ Engineering rules learned the hard way: full training-state serialization (param
 
 ## 5 · Honest caveats
 
-- **Context parity, not context advantage**: the backbone with 63 chunks of context ≈ the 4-chunk MLP (0.218 vs 0.229). On TinyStories at 4M tokens, extractable next-chunk signal is mostly local. Whether Miras memory pays for itself is *the* open scaling question.
+- ~~**Context parity, not context advantage**: the backbone with 63 chunks of context ≈ the 4-chunk MLP (0.218 vs 0.229).~~ **RESOLVED by the v2 scale-up (16M tokens, 25% wikitext mix): centered cos 0.306, decisively past the 0.229 MLP bar — the Miras memory extracts long-context value once data permits.** Scaling trend so far: 0.167 @ 2M → 0.218 @ 4M → 0.306 @ 16M tokens (≈ +0.09 per 4× data); decoded token accuracy 0.046 → 0.075 → 0.128.
 - **Raw decode is still token soup** — expected: predictions must land on the latent manifold before the AE decoder emits coherent text, and CALM-quality generation sits orders of magnitude away in data/params. NN-snap (project prediction to nearest training latent) is the honest qualitative probe at this scale.
 - Single dataset, single AE, K=4, one model size. The arm-C anomaly is unexplained.
 

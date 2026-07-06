@@ -148,8 +148,17 @@ CFG = {
     #   "energy_frozen" — stage 2a: train ONLY the energy head; gradients are
     #                     stopped at the backbone hidden states, so stage-1
     #                     representations cannot be damaged
+    #   "mse_ss"        — stage 1c: scheduled sampling — exposure-bias fix.
+    #                     Two passes: teacher-forced predictions are decoded
+    #                     to tokens and swapped into a fraction of input
+    #                     positions; loss is MSE vs TRUE targets on the
+    #                     corrupted context. Trains inference-time robustness.
     #   "energy+aux"    — stage 2b (optional): joint finetune at low LR
     "objective": "mse",
+    # stage-1c scheduled sampling
+    "ss_fraction": 0.25,           # prob a position's input is model-generated
+    "ss_steps": 8000,
+    "ss_lr": 3e-4,
     # stage-2a optimization (fresh head → its own schedule + state file;
     # stage-1 params are loaded but its optimizer state is NOT — safe because
     # stop_gradient freezes the backbone, so only virgin head params train)
@@ -458,6 +467,25 @@ def seq_energy_loss(p, seq_tokens, seq_z, loss_key):
     aux_loss = jnp.mean((d_pred - z_tgt) ** 2)
     if CFG["objective"] == "mse":
         return aux_loss
+    if CFG["objective"] == "mse_ss":
+        # stage 1c: scheduled sampling. Decode pass-1 predictions to tokens,
+        # swap them into a random fraction of input positions, then require
+        # the TRUE targets from the corrupted context (pass 2). Gradients
+        # flow only through pass 2 (argmax + stop_gradient sever pass 1).
+        pred_tok = jnp.argmax(
+            jax.vmap(frozen_ae.decode)(
+                jax.lax.stop_gradient(d_pred) * z_sd + z_mu),
+            axis=-1)                                        # (T-1, K)
+        lk1, lk2 = jax.random.split(loss_key)
+        swap = jax.random.bernoulli(
+            lk1, CFG["ss_fraction"], (pred_tok.shape[0],))  # positions 1..T-1
+        mixed = seq_tokens.at[1:].set(
+            jnp.where(swap[:, None], pred_tok, seq_tokens[1:]))
+        embs2 = AE_EMB[mixed]
+        inp2 = jax.vmap(bb.compress_input)(embs2)
+        hid2, _ = bb(inp2)
+        d2 = jax.vmap(dr)(hid2[:-1])
+        return jnp.mean((d2 - z_tgt) ** 2)
     if CFG["objective"] == "energy_frozen":
         # stage 2a: energy head only — backbone representations are frozen
         # via stop_gradient so the energy score's noise can't erode them
@@ -530,11 +558,18 @@ def eval_metrics(p, seqs, zs, mkey):
 # file: a fresh energy head must not inherit stage 1's decayed-to-floor LR.
 import json
 
-STAGE2 = CFG["objective"] != "mse"
-stage_total = CFG["stage2_steps"] if STAGE2 else CFG["total_steps"]
-stage_peak = CFG["stage2_lr"] if STAGE2 else CFG["peak_lr"]
 RUNV = CFG["run_version"]
-stage_tag = f"_{RUNV}" + ("_s2" if STAGE2 else "")
+# per-stage budgets, peaks, and file suffixes; every non-"mse" stage seeds
+# its params from the stage-1 state file when its own state doesn't exist
+_STAGES = {
+    "mse":           (CFG["total_steps"], CFG["peak_lr"], ""),
+    "mse_ss":        (CFG["ss_steps"], CFG["ss_lr"], "_ss"),
+    "energy_frozen": (CFG["stage2_steps"], CFG["stage2_lr"], "_s2"),
+    "energy+aux":    (CFG["stage2_steps"], CFG["stage2_lr"], "_s2b"),
+}
+stage_total, stage_peak, _suffix = _STAGES[CFG["objective"]]
+STAGE2 = CFG["objective"] != "mse"
+stage_tag = f"_{RUNV}{_suffix}"
 
 schedule = optax.warmup_cosine_decay_schedule(
     init_value=0.0,
@@ -570,8 +605,8 @@ elif STAGE2 and os.path.exists(S1_STATE):
     restored = eqx.tree_deserialise_leaves(
         S1_STATE, {"params": params, "opt_state": opt_state})
     params = restored["params"]
-    print("✓ stage 2 start: loaded stage-1 params, fresh head optimizer "
-          "(backbone frozen via stop_gradient)")
+    print(f"✓ {CFG['objective']} start: seeded from stage-1 params, "
+          "fresh optimizer + LR cycle")
 else:
     print("no train_state found — fresh start (global step 0)")
 
@@ -621,7 +656,7 @@ for i in range(n_sess):
         marker = ""
         # checkpoint criterion follows the stage: representation stages track
         # centered cos; energy stages track eval energy (ccos is frozen in 2a)
-        if CFG["objective"] == "mse":
+        if CFG["objective"] in ("mse", "mse_ss"):
             if ccos > best_ccos:
                 best_ccos = ccos
                 save_ckpt(params, "best")
